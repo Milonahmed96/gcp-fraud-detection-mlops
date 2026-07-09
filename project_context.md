@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 3 complete — model training + A/B comparison merged to develop
-Last completed: feature/model-training (src/training/ built, 240 tests passing)
-Next task: Phase 4 — SHAP explainability module (src/evaluation/, logged to Vertex AI Experiments)
+Phase: Phase 4 complete — SHAP explainability merged to develop
+Last completed: feature/shap-explainability (src/evaluation/ built, 318 tests passing)
+Next task: Phase 5 — FastAPI inference service (src/inference/, Dockerised, A/B traffic split config)
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -13,6 +13,7 @@ Next task: Phase 4 — SHAP explainability module (src/evaluation/, logged to Ve
 - [x] TASK 5 — feature/repo-scaffold committed, pushed, merged --no-ff into develop
 - [x] PHASE 2 — src/features/: config, schema, transforms, bigquery, feature_store, sample_data (+ 111 tests)
 - [x] PHASE 3 — src/training/: metrics, dataset, models, train, vertex, experiments (+ 129 tests)
+- [x] PHASE 4 — src/evaluation/: explainer (SHAP), experiments (Vertex + BigQuery audit log) (+ 78 tests)
 
 ## Decisions log
 | Decision | Rationale |
@@ -35,6 +36,12 @@ Next task: Phase 4 — SHAP explainability module (src/evaluation/, logged to Ve
 | Temporal split, never random | Fraud is non-stationary. A random split lets the model see next month's fraud ring while training on this month's |
 | Sample data has a 35% "stealth fraud" cohort with no injected signal | Without it both variants scored ROC-AUC 1.0 and the A/B test was degenerate. Stealth fraud sets an honest recall ceiling, as it does in production |
 | Experiment logging catches all exceptions | A model that trained successfully but could not be logged is still a model. Tracking must never fail a training job |
+| SHAP output is normalised through `normalise_shap_values` | `TreeExplainer` returns `(n,f)`, `(n,f,2)`, or a 2-element per-class list depending on shap version and model type. Taking the wrong class axis silently inverts every attribution's sign. shap itself warns that the LightGBM binary output "has changed" |
+| Attributions are documented as log-odds, and `verify_additivity` asserts it | `base + sum(shap) == raw margin`, not probability. Summing attributions and expecting a probability is a silent, common error |
+| Explainer built at training time, persisted beside the model | Constructing a `TreeExplainer` per request puts tree traversal on the hot path. A test asserts the reloaded explainer reproduces its reloaded model's probabilities |
+| `top_contributions` ranks by absolute SHAP, not signed | An auditor asking "why was this blocked?" needs the exculpatory evidence too |
+| Per-prediction attributions stored as a JSON string in BigQuery | Keeps the `prediction_log` schema stable as the feature set evolves; `JSON_VALUE` keeps it queryable |
+| `importance_shift` = total variation distance between normalised importance profiles | Scale-invariant, symmetric, bounded in [0,1]. A shift in *what drives the model* is a drift signal even when AUC is flat — Phase 6 consumes this |
 
 ## Environment
 - Python 3.11
@@ -48,28 +55,38 @@ Next task: Phase 4 — SHAP explainability module (src/evaluation/, logged to Ve
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
 ## Session handoff notes
-Phase 3 finished. `develop` carries `src/training/`: `metrics.py` (business cost + bootstrap CI),
-`dataset.py` (temporal split, local/BigQuery sources), `models.py` (the two variants, capacity
-matched), `train.py` (orchestrator + CLI), `vertex.py` (Custom Training submission), and
-`experiments.py` (Vertex AI Experiments logging). 240 tests pass; ruff is clean.
+Phase 4 finished. `develop` carries `src/evaluation/`: `explainer.py` (`FraudExplainer`,
+`normalise_shap_values`, `importance_shift`) and `experiments.py` (SHAP importance → Vertex AI
+Experiments; per-prediction attributions → BigQuery `prediction_log`). `train.py` now persists an
+explainer beside each model. 318 tests pass; ruff is clean.
 
-Current local A/B result on the sample: XGBoost cost/1k = 984.69, LightGBM = 1017.40, delta
-`-32.71 [-143.96, +29.17]` — **not significant**, so the incumbent (XGBoost) is kept. LightGBM wins
-F1 (0.452 vs 0.444) and loses on cost, which is the point of the business metric.
+A/B result unchanged from Phase 3: XGBoost cost/1k = 984.69, LightGBM = 1017.40, delta
+`-32.71 [-143.96, +29.17]` — **not significant**, incumbent kept.
+
+Global SHAP importance on the sample: `amount_vs_customer_mean` (1.42) > `amount_log` (1.08) ≈
+`amount_sum_24h` (1.08) > `customer_amount_mean_prior` (1.03) > `card_not_present` (0.99). The model
+leans on spend *relative to the customer's own baseline*, which is the desired behaviour.
 
 Nothing has been merged to `main` yet — that waits for the first deployable milestone (rule 6).
 
-**Still no GCP resource has been provisioned.** Both `--backend vertex` and the BigQuery source are
-unit-tested against fakes only. `submit_training_job`, `create_feature_store`, `ensure_dataset` and
-`log_training_run` have never run against the live API — expect small signature corrections on the
-first real invocation. Before that: fill in `.env` and run `gcloud auth application-default login`.
+**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–4 is unit-tested
+against fakes only. `submit_training_job`, `create_feature_store`, `ensure_dataset`,
+`log_training_run`, `log_global_importance`, and `log_predictions_to_bigquery` have never run
+against the live API — expect small signature corrections on first real invocation. In particular
+`aiplatform.start_run(resume=True)` in `src/evaluation/experiments.py` assumes the run already
+exists from `src/training/experiments.py`; that ordering is untested against the real SDK.
 
-Sample data is now 6,000 rows at 2.13% fraud, with a 35% stealth-fraud cohort. Regenerate with
-`uv run python -m src.features.sample_data`; a test fails if the generator changes and the CSV does
-not. Model artefacts land in `artifacts/` (gitignored).
+The `prediction_log` BigQuery table is written by `log_predictions_to_bigquery` but **has no schema
+defined in `src/features/schema.py`** and no `ensure_table` call — `PREDICTIONS_TABLE` is only a name
+constant. Phase 5 must add its schema (transaction_id, variant, fraud_probability, base_value,
+top_features JSON, timestamp) before the audit log can actually be written.
 
-Phase 4 starts with:
-`git checkout develop && git pull && git checkout -b feature/shap-explainability`
-It will build `src/evaluation/`: `shap.TreeExplainer` over both variants (both are tree ensembles,
-which is why TreeExplainer works for each), global importance, per-prediction attributions, and
-attachment of SHAP artefacts to the Vertex AI Experiments runs created in Phase 3.
+Sample data: 6,000 rows, 2.13% fraud, 35% stealth-fraud cohort. Regenerate with
+`uv run python -m src.features.sample_data`. Artefacts (models + explainers) land in `artifacts/`
+(gitignored).
+
+Phase 5 starts with:
+`git checkout develop && git pull && git checkout -b feature/inference-service`
+It will build `src/inference/`: a FastAPI app with typed Pydantic request/response schemas, model +
+explainer loaded once at startup, `/health` and `/predict` (returning probability + SHAP top-k),
+online feature lookup, a Dockerfile targeting Cloud Run, and the A/B traffic-split configuration.
