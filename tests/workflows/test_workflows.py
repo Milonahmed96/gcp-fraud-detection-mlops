@@ -200,13 +200,24 @@ class TestDeploySafety:
         assert last_smoke < shift
 
     def test_the_smoke_test_fails_the_job_on_error(self, deploy):
+        """It must exit non-zero when no audience yields a healthy response."""
         smoke = next(
             step
             for step in steps_of(deploy, "deploy")
             if step.get("name", "").startswith("Smoke-test")
         )
-        assert "set -euo pipefail" in smoke["run"]
-        assert "curl -sf" in smoke["run"]  # -f makes curl exit non-zero on 4xx/5xx
+        assert "smoke test FAILED" in smoke["run"]
+        assert "exit 1" in smoke["run"]
+        assert '\'"status":"ok"\'' in smoke["run"]
+
+    def test_no_diagnostic_step_ever_echoes_a_token(self, deploy):
+        """Probes print HTTP status codes, never credentials."""
+        for step in steps_of(deploy, "deploy"):
+            run = step.get("run", "")
+            if "curl" not in run:
+                continue
+            assert 'echo "$TOKEN"' not in run
+            assert "print-identity-token" not in run
 
     def test_the_tagged_urls_are_resolved_with_jq_e(self, deploy):
         """`jq -e` exits non-zero when a tag is missing, rather than emitting null."""
@@ -226,7 +237,7 @@ class TestDeploySafety:
             for step in steps_of(deploy, "deploy")
             if step.get("with", {}).get("token_format") == "id_token"
         ]
-        assert len(minted) == 2  # one per revision: the audience differs
+        assert len(minted) >= 2  # at least one audience per revision
 
     def test_each_id_token_audience_is_its_own_revision_url(self, deploy):
         """Cloud Run rejects a token whose audience is not the URL being called."""
