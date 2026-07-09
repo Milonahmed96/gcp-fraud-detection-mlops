@@ -1,7 +1,8 @@
 # GCP MLOps Pipeline — Real-Time Fraud Detection on Vertex AI
 
-[![CI](https://img.shields.io/badge/CI-pending-lightgrey)](https://github.com/Milonahmed96/gcp-fraud-detection-mlops/actions)
+[![CI](https://github.com/Milonahmed96/gcp-fraud-detection-mlops/actions/workflows/ci.yml/badge.svg)](https://github.com/Milonahmed96/gcp-fraud-detection-mlops/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11-blue)](https://www.python.org/downloads/release/python-3110/)
+[![Tests](https://img.shields.io/badge/tests-604%20passing-brightgreen)](https://github.com/Milonahmed96/gcp-fraud-detection-mlops/actions/workflows/ci.yml)
 [![Cloud Run](https://img.shields.io/badge/deploy-Cloud%20Run-4285F4)](https://cloud.google.com/run)
 
 A production-grade, end-to-end MLOps pipeline that detects fraudulent card transactions in real time on Google Cloud. Raw transactions land in **BigQuery**, engineered features are served at low latency from the **Vertex AI Feature Store**, two model variants (**XGBoost** and **LightGBM**) are trained and versioned on **Vertex AI** with experiment tracking, and the resulting traffic split is served from a **FastAPI** service on **Cloud Run**. Every prediction carries a **SHAP** explanation logged to Vertex AI Experiments for auditability — a hard requirement in regulated financial services. A **Cloud Scheduler** job runs a daily drift check that can trigger retraining, and **GitHub Actions** deploys to Cloud Run on every merge to `main`. The two model variants run as a live **A/B test**, compared not just on AUC and F1 but on a business cost metric that prices false negatives (missed fraud) against false positives (blocked genuine customers).
@@ -10,46 +11,54 @@ A production-grade, end-to-end MLOps pipeline that detects fraudulent card trans
 
 ## Architecture
 
+Solid arrows are implemented and tested. **Dashed arrows are designed but not wired** — see [Known limitations](#known-limitations). A diagram that draws intent as if it were fact is a lie with better typography.
+
 ```mermaid
-flowchart LR
-    subgraph Ingest["Data & Features"]
-        DS[("Transaction<br/>Data Source")]
-        BQ[("BigQuery<br/>Offline Store + Audit Log")]
-        FS[["Vertex AI<br/>Feature Store"]]
-        DS --> BQ
-        BQ -->|feature engineering| FS
+flowchart TB
+    subgraph Ingest["1 · Data &amp; Features"]
+        direction LR
+        DS[("Transaction<br/>source")] --> BQ[("BigQuery<br/>offline store")]
+        BQ -->|"src/features"| FS[["Vertex AI Feature Store<br/>(legacy API)"]]
     end
 
-    subgraph Train["Training"]
-        VT["Vertex AI Training<br/>XGBoost + LightGBM"]
-        EXP["Vertex AI Experiments<br/>metrics + SHAP"]
-        MR[["Vertex AI<br/>Model Registry"]]
-        VT --> EXP
-        VT --> MR
+    subgraph Train["2 · Training — src/training"]
+        direction LR
+        VT["Vertex AI<br/>Custom Training"] --> EXP["Vertex AI<br/>Experiments"]
+        VT --> AR[["Artifact Registry<br/>image = model + explainer"]]
     end
 
-    subgraph Serve["Serving"]
-        CR["Cloud Run<br/>FastAPI + traffic split"]
-        CL(["Client / Payment Gateway"])
-        CR <--> CL
+    subgraph Serve["3 · Serving — Cloud Run (inference image)"]
+        direction LR
+        CL(["Payment<br/>gateway"]) -->|"50%"| XGB["revision: xgb"]
+        CL -->|"50%"| LGBM["revision: lgbm"]
     end
 
-    subgraph Monitor["Monitoring"]
-        CS["Cloud Scheduler<br/>every 24h"]
-        DM["Drift Monitor<br/>src/monitoring"]
-        CS --> DM
-        DM -->|drift detected| VT
-        DM -->|reference stats| BQ
+    subgraph Ops["4 · Monitoring — Cloud Run (monitoring image)"]
+        direction LR
+        CS["Cloud Scheduler<br/>02:00 daily · OIDC"] -->|POST| DM["/drift-check<br/>PSI + SHAP shift"]
+        DB["/dashboard<br/>A/B results"]
     end
+
+    GH["CI/CD · GitHub Actions<br/>Workload Identity Federation"]
+    PL[("BigQuery<br/>prediction_log")]
 
     BQ --> VT
-    FS -->|online lookup| CR
-    MR -->|model A / model B| CR
-    CR -->|predictions + SHAP| BQ
-    CR -->|per-prediction logs| EXP
+    AR -->|"baked into image"| Serve
+    AR -->|"metrics.json"| DB
+    BQ -->|"yesterday's features"| DM
+    DM -->|"drift significant → retrain"| VT
+    GH -->|"deploy on merge to main"| Serve
+    GH --> Ops
+
+    FS -.->|"online lookup"| Serve
+    Serve -.->|"SHAP audit row"| PL
+    PL -.->|"per-variant live traffic"| DB
+
+    classDef pending stroke-dasharray:5 4,color:#8a8a8a,stroke:#8a8a8a
+    class PL,FS pending
 ```
 
-A rendered `draw.io` XML export lives in `infrastructure/` once Phase 9 completes.
+An editable [draw.io](https://app.diagrams.net) export lives at [`infrastructure/architecture.drawio`](infrastructure/architecture.drawio) — open it at app.diagrams.net via *File → Open from → Device*.
 
 ---
 
@@ -79,24 +88,32 @@ A rendered `draw.io` XML export lives in `infrastructure/` once Phase 9 complete
 
 ```
 .
-├── CLAUDE.md               # Agent instructions + engineering conventions
-├── project_context.md      # Living project state, decisions log, session handoff
-├── README.md               # You are here
-├── pyproject.toml          # Project metadata + dependencies (uv)
-├── .env.example            # Placeholder GCP config — copy to .env, never commit .env
-├── .github/
-│   └── workflows/          # GitHub Actions CI/CD (lint, test, build, deploy)
+├── CLAUDE.md                   # Agent instructions + engineering conventions
+├── project_context.md          # Living project state, decisions log, session handoff
+├── README.md                   # You are here
+├── pyproject.toml              # Metadata + dependencies. Core = inference only; extras: gcp, dev
+├── uv.lock                     # Pinned, reproducible resolution
+├── .python-version             # 3.11 — without this uv resolves 3.13
+├── .env.example                # Placeholder GCP config — copy to .env, never commit .env
+├── Dockerfile                  # Inference image (2.16 GB, no GCP SDKs)
+├── Dockerfile.monitoring       # Drift-monitor image (needs the gcp extra)
+├── .github/workflows/
+│   ├── ci.yml                  # PR gate: lint, tests, build + run both containers
+│   └── deploy.yml              # Deploy to Cloud Run on merge to main (WIF, no keys)
 ├── src/
-│   ├── features/           # Feature engineering + BigQuery ingestion + Feature Store writes
-│   ├── training/           # Vertex AI training jobs (XGBoost + LightGBM)
-│   ├── evaluation/         # SHAP explainability + A/B test metrics
-│   ├── inference/          # FastAPI app served on Cloud Run
-│   └── monitoring/         # Drift detection + Cloud Scheduler integration
-├── tests/                  # pytest unit + integration tests, mirrors src/
-├── notebooks/              # EDA + experiment notebooks (never production code)
-├── infrastructure/         # Terraform / gcloud scripts for GCP resource provisioning
+│   ├── features/               # config, schema, causal transforms, BigQuery, Feature Store, sample data
+│   ├── training/               # metrics, temporal split, model variants, train CLI, Vertex, experiments
+│   ├── evaluation/             # SHAP explainer, experiment logging, A/B report + HTML dashboard
+│   ├── inference/              # customer state, serving features, schemas, registry, FastAPI app
+│   └── monitoring/             # PSI/KS drift, scheduled check, Cloud Scheduler, monitor service
+├── tests/                      # Mirrors src/, plus tests/workflows/ which parses the CI YAML
+├── notebooks/                  # EDA + experiment notebooks (never production code)
+├── infrastructure/
+│   ├── setup_gcp.sh            # One-time idempotent bootstrap: WIF, service accounts, registry
+│   └── architecture.drawio     # Editable architecture diagram
+├── artifacts/                  # gitignored — models, explainers, metrics.json, dashboard.html
 └── data/
-    └── sample/             # Small, anonymised sample data only — no real data, no credentials
+    └── sample/                 # 6,000 synthetic transactions — no real data, no credentials
 ```
 
 ---
@@ -206,33 +223,63 @@ The same request for a domestic, card-present, £42 afternoon purchase scores `0
 
 Note the threshold is `0.5039`, not `0.5`. It is the cost-minimising threshold fitted on the validation split and read from `artifacts/metrics.json`; the service refuses to start rather than silently default it.
 
-> **Note:** modules land phase by phase. Commands referencing `src/monitoring` become live from Phase 6 onward — see `project_context.md` for the current phase.
+```bash
+# Serve the drift monitor + A/B dashboard on :8081
+MODEL_ARTIFACTS_DIR=artifacts DRIFT_SOURCE=sample \
+  uv run uvicorn src.monitoring.app:app --port 8081
+# then open http://localhost:8081/dashboard
+```
 
 ---
 
 ## GCP cost breakdown
 
-Estimates for a **typical dev/demo run**: one training cycle per model variant, a Cloud Run endpoint serving light demo traffic, and a daily drift check, over one month in `europe-west2`.
+For a **typical dev/demo month** in `europe-west2`: one training cycle per variant, two Cloud Run services on light demo traffic, and a daily drift check.
 
-| Service | Configuration | Estimated cost (USD/month) |
+I have separated what I could verify against Google's published documentation from what I could not. **Nothing here came from a metered bill** — no GCP resource has been provisioned (see [Known limitations](#known-limitations)).
+
+### Verified against Google's docs
+
+| Service | Free allowance | Source |
 |---|---|---|
-| Vertex AI Training | 2 jobs × ~20 min on `n1-standard-4` (~$0.22/hr) | **~$0.15** per full training cycle |
-| Vertex AI Experiments | Metadata storage, a few hundred runs | **~$0.00** (metadata free; artefacts billed as GCS) |
-| Cloud Run | Scale-to-zero, ~10k requests/mo, 1 vCPU / 512 MiB | **~$0.00–$2** (2M requests/mo are free-tier) |
-| Vertex AI Feature Store (managed) | ~1 GB online storage + light read traffic | **~$1–$5** (online serving nodes dominate) |
-| BigQuery | <1 GB storage, <10 GB scanned/mo | **~$0.00** (10 GB storage + 1 TB queries free/mo) |
-| Cloud Scheduler | 1 job, daily | **~$0.00** (3 jobs free/mo) |
-| Artifact Registry | ~1 GB of container images | **~$0.10** |
-| Cloud Storage | ~1 GB of model artefacts | **~$0.02** |
-| **Total** | | **≈ $2–$8 / month** |
+| Cloud Run | 2,000,000 requests, 180,000 vCPU-seconds, 360,000 GiB-seconds per month | [Cloud Run pricing](https://cloud.google.com/run/pricing) |
+| BigQuery | 10 GiB storage + 1 TiB queries per month | [BigQuery pricing](https://cloud.google.com/bigquery/pricing) |
+| Cloud Scheduler | 3 jobs per month | [Scheduler pricing](https://cloud.google.com/scheduler/pricing) |
 
-**These are estimates**, taken from the [GCP pricing pages](https://cloud.google.com/pricing) and rounded generously. Actual cost varies with region, traffic, and how long the Feature Store online nodes stay provisioned — that is the single largest cost lever here. Tear the Feature Store down when not demoing:
+Both Cloud Run services scale to zero (`--min-instances=0`) and the drift check runs once daily. At demo traffic this project's Cloud Run, BigQuery, and Scheduler usage sits **inside the free tier**.
+
+### Estimated, not verified
+
+These rates change by region and over time, and the pricing pages are JavaScript-rendered so I could not extract them programmatically. Treat them as order-of-magnitude, and check the [Pricing Calculator](https://cloud.google.com/products/calculator) before relying on them.
+
+| Service | Assumption | Rough cost |
+|---|---|---|
+| Vertex AI Custom Training | 2 jobs × ~20 min on `n1-standard-4` | cents per training cycle |
+| Vertex AI Feature Store (legacy) | 1 online serving node, provisioned continuously | **the dominant cost** — a node bills whether or not anything reads from it |
+| Artifact Registry | ~5 GB of images (2.16 GB inference + 2.67 GB monitoring) | low single-digit dollars |
+| Cloud Storage | ~1 GB of artefacts | negligible |
+| Vertex AI Experiments | Metadata only | metadata is free; artefacts bill as GCS |
+
+**The single biggest cost lever is the Feature Store online node**, which bills continuously. Tear it down when not demoing:
 
 ```bash
 gcloud ai feature-stores delete "$FEATURE_STORE_ID" --region="$GCP_REGION"
 ```
 
-The whole project is designed to fit inside the GCP free trial credit.
+The second lever is image size. Cloud Run bills cold-start time, and the inference image is 2.16 GB — already 510 MB smaller than it would be if the GCP SDKs were not confined to the `gcp` extra.
+
+The project is designed to fit inside the GCP free trial credit, but *designed to* is not *measured at*.
+
+### ⚠️ The Feature Store API this project uses is deprecated
+
+`src/features/feature_store.py` calls `aiplatform.Featurestore.create(...)` with `EntityType` and `Feature` resources. That is **Vertex AI Feature Store (Legacy)**. Google now publishes a [migration guide to Bigtable](https://docs.cloud.google.com/bigtable/docs/migrate-vertex-ai-legacy-bigtable), and the related *Optimized online serving* path is on a published sunset timeline: no new features from **17 May 2026**, APIs removed on **17 February 2027**.
+
+Two consequences worth stating plainly:
+
+1. **Anyone reading this repo as a reference should not copy that module verbatim.** The modern approach makes Feature Store a metadata layer over a BigQuery source, or drops it for Bigtable online serving directly.
+2. **It does not currently break anything**, because — as the architecture diagram shows with a dashed edge — the serving path never calls the Feature Store. It uses `InMemoryStateStore`. The migration is a genuine piece of outstanding work, not a hidden landmine.
+
+Sources: [Vertex AI pricing](https://cloud.google.com/vertex-ai/pricing) · [Migrate from Vertex AI Feature Store (Legacy) to Bigtable](https://docs.cloud.google.com/bigtable/docs/migrate-vertex-ai-legacy-bigtable) · [Feature Store online serving types](https://docs.cloud.google.com/vertex-ai/docs/featurestore/latest/online-serving-types)
 
 ---
 
@@ -482,9 +529,9 @@ Two footguns worth naming, both caught before they could fail a real deploy:
 | 6 | Drift monitoring | ✅ Complete |
 | 7 | GitHub Actions CI/CD | ✅ Complete |
 | 8 | A/B test dashboard | ✅ Complete |
-| 9 | Final polish + `v1.0.0` tag | ⬜ Not started |
+| 9 | Final polish + `v1.0.0` tag | ✅ Complete |
 
-See `project_context.md` for the live state and decisions log.
+**604 tests** pass on every push; CI is green on `main`. See `project_context.md` for the decisions log.
 
 ---
 
@@ -496,6 +543,7 @@ Stated plainly, because a portfolio project that hides its gaps teaches the read
 - **The serving path does not write to `prediction_log`.** The table schema and the writer both exist and are tested; `app.py` never calls them. Doing so needs a BigQuery client on the serving path and a background write so latency is unaffected — and the inference image deliberately excludes the BigQuery SDK, so the cleaner route is structured logging to Cloud Logging with a BigQuery sink.
 - **The A/B result on the sample is not statistically significant.** XGBoost costs less per 1,000 transactions than LightGBM, but the bootstrap interval straddles zero. The pipeline reports this honestly and keeps the incumbent rather than shipping a coin flip.
 - **`InMemoryStateStore` reads the committed CSV.** The real Vertex AI Feature Store reader satisfying `lookup(customer_id, as_of)` is not written. The interface exists so the swap is local.
+- **The Feature Store module targets a deprecated API.** `aiplatform.Featurestore` is Vertex AI Feature Store (Legacy); its Optimized online serving path is sunset on 17 February 2027. Migration is outstanding work — see the cost section. It breaks nothing today only because the serving path does not call it.
 - **The drift monitor compares the whole current batch** against the reference; windowing beyond `--start-date`/`--end-date` is not implemented.
 - **Training data is synthetic.** Real fraud data is not publicly distributable at useful fidelity. The generator injects realistic correlations *and* a 35% stealth-fraud cohort that caps achievable recall, which is why ROC-AUC sits near 0.75 rather than an implausible 1.0.
 - **Cost figures are estimates** from GCP's published pricing, not from a metered bill.
@@ -511,6 +559,18 @@ Stated plainly, because a portfolio project that hides its gaps teaches the read
 - **No credentials in git, ever.** All config flows through `.env` → `python-dotenv`.
 
 Full detail in [CLAUDE.md](CLAUDE.md).
+
+---
+
+## What this project is trying to demonstrate
+
+Not that a gradient-boosted tree can detect fraud — that is a solved exercise. Rather:
+
+- **Causality under two implementations.** The offline pipeline and the online serving path compute the same thirteen features by different means, and a test replays 150 transactions to assert they agree to the nanosecond. That test found two real bugs.
+- **A metric that reflects the business, not the leaderboard.** LightGBM wins on F1 and loses on cost. The pipeline ships the cheaper model, reports a bootstrap interval, and refuses to declare a winner when the interval straddles zero.
+- **Explanations that can be audited.** SHAP attributions in log-odds space, with an additivity check, and normalisation across the three shapes `TreeExplainer` returns — because taking the wrong class axis inverts every explanation and nothing raises.
+- **A deploy whose rollback is its ordering.** New revisions take no traffic until they pass a smoke test on their own URL. There is no rollback step because traffic never moves.
+- **Honesty about what is not done.** Every gap is written down in *Known limitations* and drawn as a dashed edge in the architecture diagram.
 
 ---
 
