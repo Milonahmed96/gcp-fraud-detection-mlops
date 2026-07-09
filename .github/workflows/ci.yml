@@ -1,0 +1,131 @@
+# Pull-request gate. Nothing merges without this passing.
+#
+# Runs no GCP calls and needs no credentials: every cloud interaction in this
+# repo is unit-tested against a fake client, so CI is free and offline.
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop]
+  workflow_call: # reused by deploy.yml so main never deploys unverified code
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        # The test suite constructs real bigquery.SchemaField objects, so the
+        # gcp extra is required even though nothing calls GCP.
+        run: uv sync --frozen --extra gcp --extra dev
+
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra gcp --extra dev
+
+      - name: Verify the committed sample is current
+        # A generator change without a regenerated CSV would silently shift
+        # every downstream metric.
+        run: uv run pytest tests/features/test_sample_data.py -q
+
+      - name: Run the full suite
+        run: uv run pytest tests/ -q
+
+  build-images:
+    name: Build images
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra gcp --extra dev
+
+      - name: Train the models
+        # Both Dockerfiles COPY artifacts/ at build time, so the images cannot
+        # be built without a training run. Small bootstrap: ~30s on the sample.
+        run: uv run python -m src.training.train --backend local --bootstrap-resamples 100
+
+      - name: Build the inference image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: false
+          load: true
+          tags: fraud-inference-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build the monitoring image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.monitoring
+          push: false
+          load: true
+          tags: fraud-drift-monitor:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the inference container
+        # Proves the image actually serves, not merely that it assembles.
+        run: |
+          docker run -d --name inference -p 8080:8080 fraud-inference-api:ci
+          for i in $(seq 1 60); do
+            curl -sf localhost:8080/health && break || sleep 2
+          done
+          curl -sf localhost:8080/health | tee /dev/stderr | grep -q '"status":"ok"'
+          curl -sf -X POST localhost:8080/predict \
+            -H 'Content-Type: application/json' \
+            -d '{"transaction_id":"ci","customer_id":"c_000","timestamp":"2024-03-01T03:15:00",
+                 "amount":4800.0,"merchant_id":"m","merchant_category":"electronics",
+                 "country":"RO","customer_home_country":"GB","card_present":false}' \
+            | tee /dev/stderr | grep -q '"is_flagged":true'
+          docker rm -f inference
+
+      - name: Smoke-test the monitoring container
+        run: |
+          docker run -d --name monitor -p 8081:8080 -e DRIFT_SOURCE=sample fraud-drift-monitor:ci
+          for i in $(seq 1 60); do
+            curl -sf localhost:8081/health && break || sleep 2
+          done
+          curl -sf localhost:8081/health | tee /dev/stderr | grep -q '"status":"ok"'
+          docker rm -f monitor
