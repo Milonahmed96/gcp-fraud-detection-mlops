@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environments
+.env
+.venv/
+
+# Notebooks
+*.ipynb_checkpoints/
+
+# ML tracking
+mlruns/
+
+# Data
+data/raw/
+
+# OS
+.DS_Store
+
+# Credentials — never commit service account keys
+*.json.key
+service-account*.json
