@@ -380,6 +380,7 @@ dependencies = [
 dev = [
     { name = "httpx" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 gcp = [
@@ -405,6 +406,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.8" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
+    { name = "pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "scikit-learn", specifier = ">=1.5" },
     { name = "scipy", specifier = ">=1.11" },
