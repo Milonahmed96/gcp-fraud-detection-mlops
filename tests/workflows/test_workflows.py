@@ -232,6 +232,16 @@ class TestDeploySafety:
     def test_the_deploy_targets_a_protected_environment(self, deploy):
         assert deploy["jobs"]["deploy"]["environment"] == "production"
 
+    def test_the_deploy_skips_cleanly_when_gcp_is_not_configured(self, deploy):
+        """Before `infrastructure/setup_gcp.sh` has been run there are no
+        credentials. The deploy must skip, not fail at the auth step and leave a
+        red cross on main."""
+        assert deploy["jobs"]["deploy"]["if"] == "vars.GCP_PROJECT_ID != ''"
+
+    def test_verify_runs_even_when_the_deploy_is_skipped(self, deploy):
+        """main stays known-good whether or not GCP exists."""
+        assert "if" not in deploy["jobs"]["verify"]
+
 
 class TestActionsArePinned:
     @pytest.mark.parametrize("name", ["ci.yml", "deploy.yml"])
