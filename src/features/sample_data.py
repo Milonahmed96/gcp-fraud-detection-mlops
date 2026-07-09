@@ -23,9 +23,16 @@ import pandas as pd
 SAMPLE_PATH = Path("data/sample/transactions_sample.csv")
 
 N_CUSTOMERS = 40
-N_TRANSACTIONS = 1_200
-FRAUD_RATE = 0.015
+N_TRANSACTIONS = 6_000
+FRAUD_RATE = 0.02
 SEED = 20240101
+
+#: Fraction of fraud that carries **no** injected signal: a normal-sized,
+#: domestic, card-present, daytime transaction that happens to be fraudulent.
+#: Real fraud includes stolen cards used carefully. Without this cohort both
+#: variants score a perfect AUC on the sample, the A/B test becomes degenerate,
+#: and the dashboard reports a number no reviewer would believe.
+STEALTH_FRAUD_FRACTION = 0.35
 
 MERCHANT_CATEGORIES = ("grocery", "fuel", "restaurant", "electronics", "travel", "gambling")
 HOME_COUNTRIES = ("GB", "GB", "GB", "IE", "FR")  # weighted toward GB
@@ -58,34 +65,43 @@ def generate_transactions(
     is_fraud = (rng.random(n_transactions) < fraud_rate).astype(int)
     fraud = is_fraud.astype(bool)
 
+    # Split fraud into "loud" (carries the classic signals) and "stealth"
+    # (indistinguishable from genuine traffic on features alone). Stealth fraud
+    # sets the ceiling on achievable recall -- exactly as it does in production.
+    stealth = fraud & (rng.random(n_transactions) < STEALTH_FRAUD_FRACTION)
+    loud = fraud & ~stealth
+
     scales = np.array([customer_scale[c] for c in customer])
     amount = rng.gamma(shape=2.0, scale=scales / 2.0)
-    # Fraudulent transactions are large relative to that customer's baseline.
-    amount[fraud] *= rng.uniform(6.0, 25.0, size=fraud.sum())
+    # Loud fraud is large relative to that customer's baseline, but the multiplier
+    # overlaps the upper tail of genuine spending -- so the classes are not
+    # linearly separable on amount alone.
+    amount[loud] *= rng.uniform(1.8, 7.0, size=loud.sum())
     amount = np.round(amount, 2)
 
     home = np.array([home_country[c] for c in customer])
     country = home.copy()
-    # ~70% of fraud is cross-border; ~3% of genuine traffic is too (holidays).
+    # ~55% of loud fraud is cross-border; ~6% of genuine traffic is too (holidays).
     foreign_mask = np.where(
-        fraud, rng.random(n_transactions) < 0.70, rng.random(n_transactions) < 0.03
+        loud, rng.random(n_transactions) < 0.55, rng.random(n_transactions) < 0.06
     )
     country[foreign_mask] = rng.choice(FOREIGN_COUNTRIES, size=foreign_mask.sum())
 
-    # Fraud skews card-not-present; genuine traffic is mostly card-present.
+    # Loud fraud skews card-not-present; genuine traffic is mostly card-present.
+    # The 20% genuine CNP rate (online shopping) blunts the signal.
     card_present = np.where(
-        fraud, rng.random(n_transactions) < 0.15, rng.random(n_transactions) < 0.88
+        loud, rng.random(n_transactions) < 0.30, rng.random(n_transactions) < 0.80
     )
 
-    # Fraud skews into the small hours; genuine traffic keeps its natural time.
-    moved_to_night = fraud & (rng.random(n_transactions) < 0.60)
+    # Loud fraud skews into the small hours; genuine traffic keeps its natural time.
+    moved_to_night = loud & (rng.random(n_transactions) < 0.45)
     night_hour = pd.to_timedelta(rng.integers(0, 6, size=n_transactions), unit="h")
     timestamp = pd.DatetimeIndex(
         np.where(moved_to_night, timestamp.normalize() + night_hour, timestamp)
     )
 
-    # Fraud over-indexes on the resale-friendly and high-risk categories.
-    high_risk = fraud & (rng.random(n_transactions) < 0.40)
+    # Loud fraud over-indexes on the resale-friendly and high-risk categories.
+    high_risk = loud & (rng.random(n_transactions) < 0.40)
     merchant_category = np.where(
         high_risk,
         rng.choice(("electronics", "gambling", "travel"), size=n_transactions),

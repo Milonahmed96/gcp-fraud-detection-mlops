@@ -85,11 +85,45 @@ class TestSignal:
     def test_fraud_amounts_are_larger(self, sample):
         fraud_median = sample.loc[sample["is_fraud"] == 1, "amount"].median()
         genuine_median = sample.loc[sample["is_fraud"] == 0, "amount"].median()
-        assert fraud_median > genuine_median * 3
+        assert fraud_median > genuine_median * 1.5
 
     def test_fraud_skews_to_the_small_hours(self, sample):
         night = sample["timestamp"].dt.hour <= 5
         assert night[sample["is_fraud"] == 1].mean() > night[sample["is_fraud"] == 0].mean()
+
+    def test_the_classes_overlap_on_amount(self, sample):
+        """Perfectly separable classes make the A/B test degenerate.
+
+        Some genuine transactions must be larger than the median fraud, or both
+        variants score a meaningless AUC of 1.0.
+        """
+        fraud_median = sample.loc[sample["is_fraud"] == 1, "amount"].median()
+        genuine = sample.loc[sample["is_fraud"] == 0, "amount"]
+        assert (genuine > fraud_median).mean() > 0.05
+
+
+class TestStealthFraud:
+    """A fraction of fraud must carry no signal at all -- it sets the recall ceiling."""
+
+    def _stealth(self, sample: pd.DataFrame) -> pd.Series:
+        fraud = sample["is_fraud"] == 1
+        domestic = sample["country"] == sample["customer_home_country"]
+        daytime = sample["timestamp"].dt.hour > 5
+        return fraud & domestic & sample["card_present"] & daytime
+
+    def test_some_fraud_looks_entirely_ordinary(self, sample):
+        assert self._stealth(sample).sum() >= 5
+
+    def test_stealth_fraud_is_a_minority_of_fraud(self, sample):
+        share = self._stealth(sample).sum() / (sample["is_fraud"] == 1).sum()
+        assert 0.0 < share < 0.5, f"stealth share {share:.2%} is implausible"
+
+    def test_genuine_traffic_also_goes_abroad_and_card_not_present(self, sample):
+        """Otherwise `is_foreign` or `card_not_present` alone would be a perfect classifier."""
+        genuine = sample["is_fraud"] == 0
+        foreign = sample["country"] != sample["customer_home_country"]
+        assert foreign[genuine].sum() > 0
+        assert (~sample["card_present"])[genuine].sum() > 0
 
     def test_engineered_ratio_separates_the_classes(self, sample):
         """`amount_vs_customer_mean` is the feature this sample exists to exercise."""
