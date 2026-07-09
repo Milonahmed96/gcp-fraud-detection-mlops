@@ -250,7 +250,7 @@ Authentication uses **Workload Identity Federation** — GitHub Actions assumes 
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Repository scaffold + documentation | ✅ Complete |
-| 2 | Data ingestion + feature engineering | ⬜ Not started |
+| 2 | Data ingestion + feature engineering | ✅ Complete |
 | 3 | Model training on Vertex AI | ⬜ Not started |
 | 4 | SHAP explainability module | ⬜ Not started |
 | 5 | FastAPI inference service | ⬜ Not started |
