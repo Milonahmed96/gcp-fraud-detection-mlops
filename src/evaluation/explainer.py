@@ -209,11 +209,21 @@ class FraudExplainer:
         ]
 
     def explain_one(self, row: pd.DataFrame | pd.Series) -> Explanation:
-        """Explain a single transaction. Accepts a one-row frame or a Series."""
-        frame = row.to_frame().T if isinstance(row, pd.Series) else row
+        """Explain a single transaction. Accepts a one-row frame or a Series.
+
+        A DataFrame is passed through with its dtypes intact. Casting it to float
+        would make the explainer score a different matrix than the caller scored
+        with `predict_proba`, so the explanation could disagree with the
+        probability it is meant to justify. Only the Series path is cast, because
+        `Series.to_frame().T` yields object columns that no model can consume.
+        """
+        if isinstance(row, pd.Series):
+            frame = row.to_frame().T.infer_objects()
+        else:
+            frame = row
         if len(frame) != 1:
             raise ExplainerError(f"explain_one expects exactly one row; got {len(frame)}")
-        return self.explain(frame.astype(float))[0]
+        return self.explain(frame)[0]
 
     def global_importance(self, X: pd.DataFrame) -> pd.Series:
         """Mean absolute SHAP value per feature, descending.
