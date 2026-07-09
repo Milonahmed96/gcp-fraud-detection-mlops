@@ -1,0 +1,214 @@
+# Deploy to Cloud Run on merge to main.
+#
+# Authentication is Workload Identity Federation: GitHub Actions presents its
+# OIDC token and GCP mints short-lived credentials. There is no service-account
+# JSON key in this repository, in GitHub secrets, or anywhere else.
+#
+# The deploy is safe by construction. Both new revisions go up with --no-traffic,
+# are smoke-tested on their own tagged URLs, and only then receive traffic. If a
+# smoke test fails the job stops and the previous revision keeps serving 100% --
+# no rollback step is needed because traffic never moved.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      xgboost_traffic:
+        description: "Percent of traffic to the XGBoost variant (rest goes to LightGBM)"
+        required: false
+        default: "50"
+
+concurrency:
+  group: deploy-main # never let two deploys race for the same traffic split
+  cancel-in-progress: false
+
+env:
+  INFERENCE_SERVICE: fraud-inference-api
+  MONITOR_SERVICE: fraud-drift-monitor
+  SCHEDULER_JOB: fraud-drift-check
+
+jobs:
+  # main never deploys code that has not passed the same gate a PR does.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    name: Deploy to Cloud Run
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write # required to mint the OIDC token for WIF
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra gcp
+
+      - name: Train the models
+        # Artefacts are baked into the image, so a revision's model is immutable
+        # and pinned to its image tag. Reproducing a prediction means pulling
+        # the tag, not guessing which model was live.
+        run: uv run python -m src.training.train --backend local
+
+      - name: Set image tags
+        id: tags
+        run: |
+          REGISTRY="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.ARTIFACT_REPOSITORY }}"
+          echo "inference=${REGISTRY}/${INFERENCE_SERVICE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "monitor=${REGISTRY}/${MONITOR_SERVICE}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the inference image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.inference }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push the monitoring image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.monitoring
+          push: true
+          tags: ${{ steps.tags.outputs.monitor }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # --- Inference: one revision per A/B variant, neither taking traffic yet ---
+
+      - name: Deploy the XGBoost revision (no traffic)
+        run: |
+          gcloud run deploy "${INFERENCE_SERVICE}" \
+            --image="${{ steps.tags.outputs.inference }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --revision-suffix="xgb-${GITHUB_SHA::7}" \
+            --set-env-vars="SERVING_VARIANT=xgboost" \
+            --tag=xgb \
+            --no-traffic \
+            --no-allow-unauthenticated \
+            --memory=2Gi --cpu=2 --concurrency=40 --min-instances=0 --max-instances=10 \
+            --quiet
+
+      - name: Deploy the LightGBM revision (no traffic)
+        run: |
+          gcloud run deploy "${INFERENCE_SERVICE}" \
+            --image="${{ steps.tags.outputs.inference }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --revision-suffix="lgbm-${GITHUB_SHA::7}" \
+            --set-env-vars="SERVING_VARIANT=lightgbm" \
+            --tag=lgbm \
+            --no-traffic \
+            --no-allow-unauthenticated \
+            --memory=2Gi --cpu=2 --concurrency=40 --min-instances=0 --max-instances=10 \
+            --quiet
+
+      - name: Smoke-test both revisions before they see a customer
+        # Each --tag gives the revision its own URL that receives no production
+        # traffic. If either check fails the job stops here and the previous
+        # revision keeps serving 100% -- the ordering IS the rollback strategy.
+        #
+        # `gcloud auth print-identity-token` alone does NOT work under Workload
+        # Identity Federation: a federated credential cannot mint an ID token.
+        # Impersonating the deployer service account can, which is why it holds
+        # serviceAccountTokenCreator on itself (see infrastructure/setup_gcp.sh).
+        # The audience must be the exact URL being called.
+        run: |
+          set -euo pipefail
+          SERVICE_JSON="$(gcloud run services describe "${INFERENCE_SERVICE}" \
+            --region="${{ vars.GCP_REGION }}" --format=json)"
+
+          for VARIANT in xgb lgbm; do
+            URL="$(echo "${SERVICE_JSON}" | jq -er --arg tag "${VARIANT}" \
+              '.status.traffic[] | select(.tag == $tag) | .url')"
+            echo "smoke-testing ${VARIANT} at ${URL}"
+
+            TOKEN="$(gcloud auth print-identity-token \
+              --impersonate-service-account="${{ secrets.WIF_SERVICE_ACCOUNT }}" \
+              --audiences="${URL}")"
+
+            curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
+              -H "Authorization: Bearer ${TOKEN}" "${URL}/health" \
+              | tee /dev/stderr | grep -q '"status":"ok"'
+          done
+
+      - name: Shift traffic per the A/B split
+        run: |
+          XGB="${{ github.event.inputs.xgboost_traffic || '50' }}"
+          LGBM=$((100 - XGB))
+          echo "splitting traffic: xgboost=${XGB}% lightgbm=${LGBM}%"
+          gcloud run services update-traffic "${INFERENCE_SERVICE}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --to-tags="xgb=${XGB},lgbm=${LGBM}" \
+            --quiet
+
+      # --- Monitoring service + its schedule ---
+
+      - name: Deploy the drift monitor
+        run: |
+          gcloud run deploy "${MONITOR_SERVICE}" \
+            --image="${{ steps.tags.outputs.monitor }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --set-env-vars="DRIFT_SOURCE=bigquery,GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID }},GCP_REGION=${{ vars.GCP_REGION }},GCP_BUCKET_NAME=${{ vars.GCP_BUCKET_NAME }},BIGQUERY_DATASET=${{ vars.BIGQUERY_DATASET }},FEATURE_STORE_ID=${{ vars.FEATURE_STORE_ID }}" \
+            --no-allow-unauthenticated \
+            --memory=4Gi --cpu=2 --timeout=900 --max-instances=1 \
+            --quiet
+
+      - name: Provision the drift-check schedule
+        # Calls our own tested, idempotent ensure_drift_check_job rather than a
+        # hand-rolled `gcloud scheduler jobs create || update`.
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GCP_BUCKET_NAME: ${{ vars.GCP_BUCKET_NAME }}
+          BIGQUERY_DATASET: ${{ vars.BIGQUERY_DATASET }}
+          FEATURE_STORE_ID: ${{ vars.FEATURE_STORE_ID }}
+        run: |
+          MONITOR_URL="$(gcloud run services describe "${MONITOR_SERVICE}" \
+            --region="${GCP_REGION}" --format='value(status.url)')"
+          uv run python -m src.monitoring.scheduler \
+            --target-uri="${MONITOR_URL}/drift-check" \
+            --service-account="${{ secrets.SCHEDULER_SERVICE_ACCOUNT }}" \
+            --job-name="${SCHEDULER_JOB}"
+
+      - name: Summarise the deploy
+        run: |
+          URL="$(gcloud run services describe "${INFERENCE_SERVICE}" \
+            --region="${{ vars.GCP_REGION }}" --format='value(status.url)')"
+          {
+            echo "### Deployed \`${GITHUB_SHA::7}\`"
+            echo ""
+            echo "| Service | URL |"
+            echo "|---|---|"
+            echo "| Inference | ${URL} |"
+            echo "| Drift monitor | (private) |"
+            echo ""
+            echo "Traffic split: xgboost ${{ github.event.inputs.xgboost_traffic || '50' }}% / lightgbm the remainder."
+          } >> "$GITHUB_STEP_SUMMARY"
