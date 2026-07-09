@@ -165,8 +165,31 @@ class TestDeploySafety:
         assert deploy["concurrency"]["cancel-in-progress"] is False
 
     def test_new_revisions_take_no_traffic_on_deploy(self, deploy):
+        """`--no-traffic` is applied to every revision that *can* take it.
+
+        Cloud Run rejects the flag when creating a service:
+            ERROR: --no-traffic not supported when creating a new service.
+        So the first revision of a brand-new service deploys without it — which
+        is safe, because there is no live revision to protect. Every later
+        deploy is guarded. Discovered on the first real deploy."""
         script = run_script(deploy, "deploy")
-        assert script.count("--no-traffic") == 2  # one per variant
+        assert "--no-traffic" in script
+        assert "steps.traffic.outputs.flag" in script
+
+    def test_the_first_deploy_is_detected_rather_than_assumed(self, deploy):
+        script = run_script(deploy, "deploy")
+        assert "gcloud run services describe" in script
+        assert "first deploy" in script
+
+    def test_the_second_variant_always_takes_no_traffic(self, deploy):
+        """By the time lgbm deploys the service exists, so it is unconditional."""
+        lgbm = next(
+            step
+            for step in steps_of(deploy, "deploy")
+            if "LightGBM revision" in step.get("name", "")
+        )
+        assert "--no-traffic" in lgbm["run"]
+        assert "steps.traffic.outputs.flag" not in lgbm["run"]
 
     def test_revisions_are_smoke_tested_before_traffic_shifts(self, deploy):
         """The ordering IS the rollback strategy: if the smoke test fails, the
