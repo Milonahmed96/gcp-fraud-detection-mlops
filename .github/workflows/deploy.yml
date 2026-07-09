@@ -40,6 +40,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
 
+    # Skip cleanly when the project has not been bootstrapped yet, rather than
+    # failing at the auth step. Run infrastructure/setup_gcp.sh and set the
+    # repository variables to enable deploys. `verify` still runs on every push
+    # to main, so main is always known-good even before GCP exists.
+    if: vars.GCP_PROJECT_ID != ''
+
     permissions:
       contents: read
       id-token: write # required to mint the OIDC token for WIF
