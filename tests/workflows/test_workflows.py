@@ -243,6 +243,29 @@ class TestDeploySafety:
         assert "if" not in deploy["jobs"]["verify"]
 
 
+class TestBuildxDriver:
+    """`cache-to: type=gha` fails on the default docker driver with
+    "Cache export is not supported for the docker driver". Caught by a real CI
+    run, not by reading the docs."""
+
+    @pytest.mark.parametrize(
+        ("name", "job"), [("ci.yml", "build-images"), ("deploy.yml", "deploy")]
+    )
+    def test_a_job_using_the_gha_cache_sets_up_buildx_first(self, name, job):
+        steps = steps_of(load(name), job)
+        uses = [step.get("uses", "") for step in steps]
+
+        cache_indices = [
+            i
+            for i, step in enumerate(steps)
+            if "type=gha" in str(step.get("with", {}).get("cache-to", ""))
+        ]
+        assert cache_indices, f"{name}:{job} does not use the GHA build cache"
+
+        buildx = next(i for i, u in enumerate(uses) if "docker/setup-buildx-action" in u)
+        assert buildx < min(cache_indices), "buildx must be set up before any cached build"
+
+
 class TestActionsArePinned:
     @pytest.mark.parametrize("name", ["ci.yml", "deploy.yml"])
     def test_every_action_pins_a_major_version(self, name):
