@@ -158,15 +158,51 @@ uv run python -m src.training.train --backend vertex --source bigquery \
 # Regenerate the synthetic sample data
 uv run python -m src.features.sample_data
 
-# Serve the inference API locally on :8080
-uv run uvicorn src.inference.main:app --reload --port 8080
+# Serve the inference API locally on :8080 (needs the artefacts from the step above)
+uv run uvicorn src.inference.app:app --reload --port 8080
 
-# Build the container exactly as Cloud Run will
+# Build and run the container exactly as Cloud Run will
 docker build -t fraud-inference-api .
-docker run --rm -p 8080:8080 --env-file .env fraud-inference-api
+docker run --rm -p 8080:8080 -e SERVING_VARIANT=xgboost fraud-inference-api
 ```
 
-> **Note:** modules land phase by phase. Commands referencing `src/inference` and `src/training` become live from Phase 3 onward — see `project_context.md` for the current phase.
+Dependencies are split so the serving image stays lean. `uv sync` installs only what inference needs; add extras for everything else:
+
+```bash
+uv sync                            # inference only — what the Docker image installs
+uv sync --extra gcp --extra dev    # + BigQuery/Vertex SDKs + pytest/ruff (what CI uses)
+```
+
+### Scoring a transaction
+
+```bash
+curl -X POST localhost:8080/predict -H 'Content-Type: application/json' -d '{
+  "transaction_id": "txn_001", "customer_id": "c_000",
+  "timestamp": "2024-03-01T03:15:00", "amount": 4800.0,
+  "merchant_id": "m_012", "merchant_category": "electronics",
+  "country": "RO", "customer_home_country": "GB", "card_present": false }'
+```
+
+```json
+{
+  "transaction_id": "txn_001", "variant": "xgboost",
+  "fraud_probability": 0.9945, "threshold": 0.5039, "is_flagged": true,
+  "base_value": 1.7425, "latency_ms": 8.97, "new_customer": false,
+  "top_features": [
+    {"feature": "amount_vs_customer_mean",  "value": 46.41,  "shap_value":  3.074, "direction": "toward_fraud"},
+    {"feature": "is_foreign",               "value": 1.0,    "shap_value":  1.607, "direction": "toward_fraud"},
+    {"feature": "seconds_since_prev_txn",   "value": 85936,  "shap_value": -1.463, "direction": "toward_genuine"},
+    {"feature": "customer_amount_mean_prior","value": 103.44,"shap_value": -1.335, "direction": "toward_genuine"},
+    {"feature": "card_not_present",         "value": 1.0,    "shap_value":  1.307, "direction": "toward_fraud"}
+  ]
+}
+```
+
+The same request for a domestic, card-present, £42 afternoon purchase scores `0.0011` and is not flagged. Handler latency is **6–13 ms including the SHAP explanation** — measured locally and in the container.
+
+Note the threshold is `0.5039`, not `0.5`. It is the cost-minimising threshold fitted on the validation split and read from `artifacts/metrics.json`; the service refuses to start rather than silently default it.
+
+> **Note:** modules land phase by phase. Commands referencing `src/monitoring` become live from Phase 6 onward — see `project_context.md` for the current phase.
 
 ---
 
@@ -270,6 +306,40 @@ Globally, `amount_vs_customer_mean` is the strongest driver (mean |SHAP| 1.42), 
 
 ---
 
+## Inference service
+
+A FastAPI app on Cloud Run. **One revision per model variant**, selected by the `SERVING_VARIANT` environment variable; Cloud Run's native revision traffic splitting performs the A/B allocation, so there is no routing logic in application code and no shared mutable state between variants.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Readiness probe. Returns 503, with the reason, if artefacts failed to load |
+| `POST /predict` | Score one transaction; returns probability, decision, and SHAP top-5 |
+
+The model, the SHAP explainer, and the trained threshold load once at startup. A startup failure is *recorded*, not raised — the process stays up so `/health` can tell an operator why it is unhealthy, rather than handing Cloud Run a crash loop.
+
+### Defeating train/serve skew
+
+This is the hard part of real-time ML, and it gets its own module (`src/inference/state.py`) and its own test file (`tests/inference/test_skew.py`).
+
+Offline, features are engineered over a whole history with pandas rolling windows. Online, there is one transaction and a Feature Store lookup. These are two implementations of the same function, and if they disagree the model receives inputs it never trained on — silently, with offline metrics still looking healthy.
+
+The naive design, storing precomputed window aggregates in the Feature Store, does not work: a trailing 24h window depends on *when you ask*, and the stored value was computed when the customer last transacted. It goes stale by exactly the inter-transaction gap, which is precisely when velocity matters. So the online store holds the customer's **recent event log**, and the windows are computed against the incoming transaction's own timestamp.
+
+`test_skew.py` replays 150 sample transactions through both paths and asserts every one of the 13 features matches exactly, including dtype. Two real bugs surfaced this way:
+
+- **Microsecond truncation.** `pd.Timedelta.total_seconds()` inherits `datetime.timedelta`'s microsecond resolution, so `seconds_since_prev_txn` came out as `220.472044` where training saw `220.472044709`. Fixed by dividing nanoseconds directly.
+- **A half-open window.** pandas rolling uses `(t − w, t]`, so an event *exactly* one hour old is excluded. The obvious `<=` would have been wrong on exactly the high-velocity transactions the feature exists to catch.
+
+The customer state lookup is also causal: `lookup(customer_id, as_of=event_time)` never returns the transaction being scored, nor anything after it — which protects against a duplicated or late-arriving write in production, not just historical replay.
+
+### Container
+
+Multi-stage build on `python:3.11-slim`, running as a non-root user. `libgomp1` is installed explicitly — both XGBoost and LightGBM link against OpenMP, and without it `import lightgbm` fails at startup with an opaque loader error.
+
+Because every GCP call in this repo is lazy-imported, the BigQuery and Vertex AI SDKs live in an optional `gcp` extra and never enter the serving image, cutting it from **2.67 GB to 2.16 GB**. Cloud Run charges cold-start time against image size.
+
+---
+
 ## CI/CD
 
 `.github/workflows/` defines the pipeline (Phase 7):
@@ -298,7 +368,7 @@ Authentication uses **Workload Identity Federation** — GitHub Actions assumes 
 | 2 | Data ingestion + feature engineering | ✅ Complete |
 | 3 | Model training on Vertex AI | ✅ Complete |
 | 4 | SHAP explainability module | ✅ Complete |
-| 5 | FastAPI inference service | ⬜ Not started |
+| 5 | FastAPI inference service | ✅ Complete |
 | 6 | Drift monitoring | ⬜ Not started |
 | 7 | GitHub Actions CI/CD | ⬜ Not started |
 | 8 | A/B test dashboard | ⬜ Not started |
