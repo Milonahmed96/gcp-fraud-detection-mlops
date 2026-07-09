@@ -160,34 +160,65 @@ jobs:
             --memory=2Gi --cpu=2 --concurrency=40 --min-instances=0 --max-instances=10 \
             --quiet
 
-      - name: Smoke-test both revisions before they see a customer
-        # Each --tag gives the revision its own URL that receives no production
-        # traffic. If either check fails the job stops here and the previous
-        # revision keeps serving 100% -- the ordering IS the rollback strategy.
-        #
-        # `gcloud auth print-identity-token` alone does NOT work under Workload
-        # Identity Federation: a federated credential cannot mint an ID token.
-        # Impersonating the deployer service account can, which is why it holds
-        # serviceAccountTokenCreator on itself (see infrastructure/setup_gcp.sh).
-        # The audience must be the exact URL being called.
+      - name: Resolve the tagged revision URLs
+        id: urls
+        # Each --tag gives the revision its own hostname that receives no
+        # production traffic. `jq -er` exits non-zero if a tag is missing.
         run: |
           set -euo pipefail
           SERVICE_JSON="$(gcloud run services describe "${INFERENCE_SERVICE}" \
             --region="${{ vars.GCP_REGION }}" --format=json)"
-
           for VARIANT in xgb lgbm; do
             URL="$(echo "${SERVICE_JSON}" | jq -er --arg tag "${VARIANT}" \
               '.status.traffic[] | select(.tag == $tag) | .url')"
-            echo "smoke-testing ${VARIANT} at ${URL}"
-
-            TOKEN="$(gcloud auth print-identity-token \
-              --impersonate-service-account="${{ secrets.WIF_SERVICE_ACCOUNT }}" \
-              --audiences="${URL}")"
-
-            curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
-              -H "Authorization: Bearer ${TOKEN}" "${URL}/health" \
-              | tee /dev/stderr | grep -q '"status":"ok"'
+            echo "${VARIANT}=${URL}" >> "$GITHUB_OUTPUT"
+            echo "${VARIANT} -> ${URL}"
           done
+
+      # An ID token is minted per audience, and Cloud Run requires the audience
+      # to be the exact URL being called -- hence one auth step per revision.
+      #
+      # NOT `gcloud auth print-identity-token --impersonate-service-account`:
+      # that self-impersonation path fails under Workload Identity Federation.
+      # `google-github-actions/auth` asks Google's STS for an ID token directly,
+      # which is the supported mechanism. Found on the first real deploy.
+      - name: Mint an ID token for the xgb revision
+        id: idtoken_xgb
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.urls.outputs.xgb }}
+          id_token_include_email: true
+
+      - name: Smoke-test the xgb revision before it sees a customer
+        # If this fails the job stops and the previous revision keeps serving
+        # 100%. The ordering IS the rollback strategy.
+        run: |
+          set -euo pipefail
+          curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
+            -H "Authorization: Bearer ${{ steps.idtoken_xgb.outputs.id_token }}" \
+            "${{ steps.urls.outputs.xgb }}/health" \
+            | tee /dev/stderr | grep -q '"status":"ok"'
+
+      - name: Mint an ID token for the lgbm revision
+        id: idtoken_lgbm
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.urls.outputs.lgbm }}
+          id_token_include_email: true
+
+      - name: Smoke-test the lgbm revision before it sees a customer
+        run: |
+          set -euo pipefail
+          curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
+            -H "Authorization: Bearer ${{ steps.idtoken_lgbm.outputs.id_token }}" \
+            "${{ steps.urls.outputs.lgbm }}/health" \
+            | tee /dev/stderr | grep -q '"status":"ok"'
 
       - name: Shift traffic per the A/B split
         run: |
