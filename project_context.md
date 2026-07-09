@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 2 complete — data ingestion + feature engineering merged to develop
-Last completed: feature/data-ingestion (src/features/ built, 111 tests passing)
-Next task: Phase 3 — model training on Vertex AI (XGBoost + LightGBM jobs, experiment tracking)
+Phase: Phase 3 complete — model training + A/B comparison merged to develop
+Last completed: feature/model-training (src/training/ built, 240 tests passing)
+Next task: Phase 4 — SHAP explainability module (src/evaluation/, logged to Vertex AI Experiments)
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -12,6 +12,7 @@ Next task: Phase 3 — model training on Vertex AI (XGBoost + LightGBM jobs, exp
 - [x] TASK 4 — repository structure scaffolded (src/, tests/, notebooks/, infrastructure/, .github/workflows/, data/sample/) + pyproject.toml, .env.example, .gitignore
 - [x] TASK 5 — feature/repo-scaffold committed, pushed, merged --no-ff into develop
 - [x] PHASE 2 — src/features/: config, schema, transforms, bigquery, feature_store, sample_data (+ 111 tests)
+- [x] PHASE 3 — src/training/: metrics, dataset, models, train, vertex, experiments (+ 129 tests)
 
 ## Decisions log
 | Decision | Rationale |
@@ -27,6 +28,13 @@ Next task: Phase 3 — model training on Vertex AI (XGBoost + LightGBM jobs, exp
 | GCP clients are injected, never constructed implicitly | Makes the credential boundary explicit and lets every BigQuery/Vertex function be unit-tested against a fake with no network |
 | Date bounds are bound query parameters, not f-string interpolation | Prevents SQL injection and forces callers through timestamp validation |
 | Python pinned to 3.11 via `.python-version` | `requires-python = ">=3.11"` alone let uv resolve 3.13, which changes BigQuery SDK behaviour. Discovered via a test failure |
+| Training runs behind `--backend local\|vertex` | Same fitting code both ways; `vertex` ships `train.py` to a managed machine and runs it with `--backend local`. CI and pytest use `local` (free, no GCP); the portfolio demo uses `vertex` |
+| Business cost, not AUC/F1, decides the A/B winner | A missed fraud costs its transaction amount; a blocked genuine customer costs a flat ~£5. F1 implicitly prices them equally. On the current sample LightGBM wins F1 and loses on cost |
+| Winner reported with a bootstrap CI; ties keep the incumbent | The current cost delta is `[-143.96, +29.17]`, straddling zero. Shipping the point-estimate "winner" would be shipping a coin flip |
+| Decision threshold fitted on validation, never test | Tuning the threshold on test leaks and flatters every variant. A test asserts refitting on test can only lower cost — if it doesn't, the threshold leaked |
+| Temporal split, never random | Fraud is non-stationary. A random split lets the model see next month's fraud ring while training on this month's |
+| Sample data has a 35% "stealth fraud" cohort with no injected signal | Without it both variants scored ROC-AUC 1.0 and the A/B test was degenerate. Stealth fraud sets an honest recall ceiling, as it does in production |
+| Experiment logging catches all exceptions | A model that trained successfully but could not be logged is still a model. Tracking must never fail a training job |
 
 ## Environment
 - Python 3.11
@@ -40,23 +48,28 @@ Next task: Phase 3 — model training on Vertex AI (XGBoost + LightGBM jobs, exp
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
 ## Session handoff notes
-Phase 2 finished. `develop` carries `src/features/` end to end: `config.py` (env-driven, rejects
-unfilled `.env.example` placeholders), `schema.py` (the shared contract), `transforms.py` (causal
-feature engineering), `bigquery.py` (offline store + parameterised training-set query),
-`feature_store.py` (Vertex AI online store), and `sample_data.py` (deterministic synthetic data).
-111 tests pass; `ruff check` and `ruff format --check` are clean.
+Phase 3 finished. `develop` carries `src/training/`: `metrics.py` (business cost + bootstrap CI),
+`dataset.py` (temporal split, local/BigQuery sources), `models.py` (the two variants, capacity
+matched), `train.py` (orchestrator + CLI), `vertex.py` (Custom Training submission), and
+`experiments.py` (Vertex AI Experiments logging). 240 tests pass; ruff is clean.
+
+Current local A/B result on the sample: XGBoost cost/1k = 984.69, LightGBM = 1017.40, delta
+`-32.71 [-143.96, +29.17]` — **not significant**, so the incumbent (XGBoost) is kept. LightGBM wins
+F1 (0.452 vs 0.444) and loses on cost, which is the point of the business metric.
 
 Nothing has been merged to `main` yet — that waits for the first deployable milestone (rule 6).
 
-**No GCP resource has actually been provisioned.** Every cloud call is unit-tested against a fake
-client; none has been executed against a live project. The first real `gcloud` interaction happens
-in Phase 3. Before then the user must fill in `.env` and run `gcloud auth application-default login`.
-`ensure_dataset` / `ensure_table` / `create_feature_store` are therefore *written but unexercised*
-against the real API — expect small signature corrections on first live run.
+**Still no GCP resource has been provisioned.** Both `--backend vertex` and the BigQuery source are
+unit-tested against fakes only. `submit_training_job`, `create_feature_store`, `ensure_dataset` and
+`log_training_run` have never run against the live API — expect small signature corrections on the
+first real invocation. Before that: fill in `.env` and run `gcloud auth application-default login`.
 
-Sample data lives at `data/sample/transactions_sample.csv` (1,200 rows, 1.92% fraud). Regenerate
-with `uv run python -m src.features.sample_data`. A test fails if the generator changes and the CSV
-is not regenerated.
+Sample data is now 6,000 rows at 2.13% fraud, with a 35% stealth-fraud cohort. Regenerate with
+`uv run python -m src.features.sample_data`; a test fails if the generator changes and the CSV does
+not. Model artefacts land in `artifacts/` (gitignored).
 
-Phase 3 starts with:
-`git checkout develop && git pull && git checkout -b feature/model-training`
+Phase 4 starts with:
+`git checkout develop && git pull && git checkout -b feature/shap-explainability`
+It will build `src/evaluation/`: `shap.TreeExplainer` over both variants (both are tree ensembles,
+which is why TreeExplainer works for each), global importance, per-prediction attributions, and
+attachment of SHAP artefacts to the Vertex AI Experiments runs created in Phase 3.
