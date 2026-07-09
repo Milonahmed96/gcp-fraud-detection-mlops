@@ -68,9 +68,13 @@ for ROLE in \
 done
 
 echo "==> letting the deployer mint ID tokens for the smoke test"
-# A Workload Identity federated credential cannot mint an ID token directly, so
-# the deploy impersonates this service account to get one for the private
-# Cloud Run health check. Without this binding, the smoke test 403s.
+# The smoke test calls the private Cloud Run revision, which needs an ID token
+# whose audience is the revision URL. `google-github-actions/auth` obtains one
+# via IAM Credentials `generateIdToken` on this service account.
+#
+# Note: `gcloud auth print-identity-token --impersonate-service-account` does
+# NOT work here, whatever the docs imply. It fails under Workload Identity
+# Federation, which the first real deploy demonstrated.
 gcloud iam service-accounts add-iam-policy-binding "${DEPLOYER_EMAIL}" \
   --member="serviceAccount:${DEPLOYER_EMAIL}" \
   --role="roles/iam.serviceAccountTokenCreator" \

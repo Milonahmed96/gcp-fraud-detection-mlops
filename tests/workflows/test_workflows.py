@@ -194,37 +194,48 @@ class TestDeploySafety:
     def test_revisions_are_smoke_tested_before_traffic_shifts(self, deploy):
         """The ordering IS the rollback strategy: if the smoke test fails, the
         job stops and the previous revision keeps serving 100%."""
-        script = run_script(deploy, "deploy")
-        smoke = script.index("smoke-testing")
-        shift = script.index("update-traffic")
-        assert smoke < shift
+        names = [step.get("name", "") for step in steps_of(deploy, "deploy")]
+        last_smoke = max(i for i, n in enumerate(names) if n.startswith("Smoke-test"))
+        shift = next(i for i, n in enumerate(names) if "Shift traffic" in n)
+        assert last_smoke < shift
 
     def test_the_smoke_test_fails_the_job_on_error(self, deploy):
         smoke = next(
             step
             for step in steps_of(deploy, "deploy")
-            if "smoke-test" in step.get("name", "").lower()
+            if step.get("name", "").startswith("Smoke-test")
         )
         assert "set -euo pipefail" in smoke["run"]
         assert "curl -sf" in smoke["run"]  # -f makes curl exit non-zero on 4xx/5xx
-        assert "jq -er" in smoke["run"]  # -e makes jq exit non-zero on a null result
 
-    def test_the_smoke_test_impersonates_to_mint_an_id_token(self, deploy):
-        """A Workload Identity federated credential cannot mint an ID token
-        directly. Bare `gcloud auth print-identity-token` would 403 against the
-        private service on every deploy."""
-        smoke = next(
+    def test_the_tagged_urls_are_resolved_with_jq_e(self, deploy):
+        """`jq -e` exits non-zero when a tag is missing, rather than emitting null."""
+        urls = next(step for step in steps_of(deploy, "deploy") if step.get("id") == "urls")
+        assert "jq -er" in urls["run"]
+
+    def test_the_id_token_is_minted_by_the_auth_action_not_by_impersonation(self, deploy):
+        """`gcloud auth print-identity-token --impersonate-service-account` fails
+        under Workload Identity Federation. `google-github-actions/auth` asks
+        Google's STS for an ID token directly. Found on the first real deploy."""
+        script = run_script(deploy, "deploy")
+        assert "print-identity-token" not in script
+        assert "--impersonate-service-account" not in script
+
+        minted = [
             step
             for step in steps_of(deploy, "deploy")
-            if "smoke-test" in step.get("name", "").lower()
-        )
-        assert "--impersonate-service-account" in smoke["run"]
-        assert "--audiences=" in smoke["run"]
+            if step.get("with", {}).get("token_format") == "id_token"
+        ]
+        assert len(minted) == 2  # one per revision: the audience differs
 
-    def test_the_bootstrap_grants_token_creator_for_that_impersonation(self):
-        """Without this binding the smoke test 403s and nothing ever deploys."""
-        script = (REPO_ROOT / "infrastructure" / "setup_gcp.sh").read_text()
-        assert "roles/iam.serviceAccountTokenCreator" in script
+    def test_each_id_token_audience_is_its_own_revision_url(self, deploy):
+        """Cloud Run rejects a token whose audience is not the URL being called."""
+        for step in steps_of(deploy, "deploy"):
+            with_block = step.get("with", {})
+            if with_block.get("token_format") == "id_token":
+                audience = with_block["id_token_audience"]
+                assert "steps.urls.outputs." in audience
+                assert with_block["id_token_include_email"] is True
 
     def test_both_variants_are_deployed_as_separate_revisions(self, deploy):
         script = run_script(deploy, "deploy")
