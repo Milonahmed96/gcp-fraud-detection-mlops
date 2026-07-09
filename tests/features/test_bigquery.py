@@ -107,6 +107,60 @@ class TestSchemaConversion:
         assert len(names) == len(set(names))
 
 
+class TestPredictionLog:
+    """The audit log table. Phase 4 wrote to it before it had a schema."""
+
+    def test_schema_covers_the_audit_question(self):
+        """'Why was transaction X blocked on date Y, and by which variant?'"""
+        names = [f.name for f in bq.prediction_log_schema()]
+        for required in (
+            "transaction_id",
+            "customer_id",
+            "timestamp",
+            "variant",
+            "fraud_probability",
+            "threshold",
+            "is_flagged",
+            "base_value",
+            "top_features",
+        ):
+            assert required in names
+
+    def test_attributions_are_stored_as_a_json_string(self):
+        field = next(f for f in bq.prediction_log_schema() if f.name == "top_features")
+        assert field.field_type == "STRING"
+
+    def test_latency_is_nullable(self):
+        """A prediction is still auditable if the latency probe failed."""
+        field = next(f for f in bq.prediction_log_schema() if f.name == "latency_ms")
+        assert field.mode == "NULLABLE"
+
+    def test_ensure_prediction_log_partitions_and_clusters_for_ab_queries(self, config):
+        client = FakeClient()
+        ref = bq.ensure_prediction_log(client, config)
+
+        assert ref == "test-project.fraud_features.prediction_log"
+        table, exists_ok = client.created_tables[0]
+        assert exists_ok is True
+        assert table.time_partitioning.field == "timestamp"
+        # The A/B dashboard groups by variant; clustering keeps that scan cheap.
+        assert table.clustering_fields == ["variant", "customer_id"]
+
+    def test_the_explanation_writer_matches_this_schema(self):
+        """`log_predictions_to_bigquery` must not write columns the table lacks."""
+        from src.evaluation.experiments import explanation_rows
+        from src.evaluation.explainer import Explanation, FeatureAttribution
+
+        explanation = Explanation(
+            base_value=-1.0,
+            attributions=(FeatureAttribution("is_foreign", 1.0, 2.0),),
+            probability=0.9,
+        )
+        written = set(explanation_rows(["t1"], "xgboost", [explanation]).columns)
+        declared = {f.name for f in bq.prediction_log_schema()}
+        assert written <= declared, f"writer emits undeclared columns: {written - declared}"
+
+
 class TestEnsureDataset:
     def test_creates_dataset_in_the_configured_region(self, config):
         client = FakeClient()

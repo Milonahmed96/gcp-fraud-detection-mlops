@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 4 complete — SHAP explainability merged to develop
-Last completed: feature/shap-explainability (src/evaluation/ built, 318 tests passing)
-Next task: Phase 5 — FastAPI inference service (src/inference/, Dockerised, A/B traffic split config)
+Phase: Phase 5 complete — FastAPI inference service merged to develop
+Last completed: feature/inference-service (src/inference/ built, 415 tests passing, container verified)
+Next task: Phase 6 — drift monitoring (src/monitoring/, Cloud Scheduler integration)
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -14,6 +14,7 @@ Next task: Phase 5 — FastAPI inference service (src/inference/, Dockerised, A/
 - [x] PHASE 2 — src/features/: config, schema, transforms, bigquery, feature_store, sample_data (+ 111 tests)
 - [x] PHASE 3 — src/training/: metrics, dataset, models, train, vertex, experiments (+ 129 tests)
 - [x] PHASE 4 — src/evaluation/: explainer (SHAP), experiments (Vertex + BigQuery audit log) (+ 78 tests)
+- [x] PHASE 5 — src/inference/: state, features, schemas, registry, app; Dockerfile; prediction_log schema (+ 97 tests)
 
 ## Decisions log
 | Decision | Rationale |
@@ -42,6 +43,17 @@ Next task: Phase 5 — FastAPI inference service (src/inference/, Dockerised, A/
 | `top_contributions` ranks by absolute SHAP, not signed | An auditor asking "why was this blocked?" needs the exculpatory evidence too |
 | Per-prediction attributions stored as a JSON string in BigQuery | Keeps the `prediction_log` schema stable as the feature set evolves; `JSON_VALUE` keeps it queryable |
 | `importance_shift` = total variation distance between normalised importance profiles | Scale-invariant, symmetric, bounded in [0,1]. A shift in *what drives the model* is a drift signal even when AUC is flat — Phase 6 consumes this |
+| Online store holds the customer's **recent event log**, not precomputed window aggregates | A trailing 24h window depends on when you ask. A stored aggregate is stale by exactly the inter-transaction gap — precisely when velocity matters. Windows are computed at request time against the incoming timestamp |
+| `elapsed_seconds` divides nanoseconds instead of calling `Timedelta.total_seconds()` | The scalar method inherits `datetime.timedelta`'s microsecond resolution and truncated `seconds_since_prev_txn` to `220.472044` vs training's `220.472044709`. Real skew, caught by `tests/inference/test_skew.py` |
+| Serving windows use a strict `<` (half-open `(t-w, t]`) | Mirrors pandas' `closed="right"` rolling. An event exactly `w` old is excluded. `<=` would be wrong on exactly the high-velocity transactions the feature exists to catch |
+| `store.lookup(customer_id, as_of=event_time)` | State is only defined relative to the transaction being scored. Guards historical replay *and* a duplicated/late-arriving write in production |
+| One Cloud Run revision per variant, chosen by `SERVING_VARIANT` | Cloud Run's native traffic splitting does the A/B allocation. No routing logic in app code, no shared mutable state between variants |
+| Threshold read from `artifacts/metrics.json`, never defaulted to 0.5 | 0.5 discards the entire business-cost calibration. The service refuses to start rather than come up healthy and mis-calibrated |
+| `create_app()` factory; state on `app.state`, not module globals | Two app instances (one per variant) must not clobber each other's loaded model. Found via test pollution |
+| Startup failure is recorded, not raised | `/health` can then report *why* it is unhealthy. A container that exits on startup gives Cloud Run only a crash loop |
+| GCP SDKs moved to an optional `gcp` extra | Every GCP call is lazy-imported, so the serving image never needs them. Cuts the Cloud Run image from 2.67 GB to 2.16 GB; Cloud Run bills cold-start time against image size |
+| `to_naive_utc` converts offsets rather than dropping them | Discarding `+02:00` would shift the transaction two hours and silently change `is_night`, `hour_of_day`, and every velocity window |
+| Pydantic `extra="forbid"` on the request schema | A typo'd field name is a bug, not something to silently ignore into a confidently wrong prediction |
 
 ## Environment
 - Python 3.11
@@ -55,38 +67,50 @@ Next task: Phase 5 — FastAPI inference service (src/inference/, Dockerised, A/
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
 ## Session handoff notes
-Phase 4 finished. `develop` carries `src/evaluation/`: `explainer.py` (`FraudExplainer`,
-`normalise_shap_values`, `importance_shift`) and `experiments.py` (SHAP importance → Vertex AI
-Experiments; per-prediction attributions → BigQuery `prediction_log`). `train.py` now persists an
-explainer beside each model. 318 tests pass; ruff is clean.
+Phase 5 finished. `develop` carries `src/inference/`: `state.py` (causal `CustomerState` +
+`InMemoryStateStore`), `features.py` (`build_serving_features`), `schemas.py` (Pydantic contract),
+`registry.py` (`load_bundle`, trained threshold), `app.py` (`create_app()`, `/health`, `/predict`),
+plus a `Dockerfile` and `.dockerignore`. The Phase 4 gap is closed: `prediction_log` now has a real
+schema and `ensure_prediction_log()`. 415 tests pass; ruff is clean.
 
-A/B result unchanged from Phase 3: XGBoost cost/1k = 984.69, LightGBM = 1017.40, delta
-`-32.71 [-143.96, +29.17]` — **not significant**, incumbent kept.
+**Verified for real, not just unit-tested.** The service was started with uvicorn and curled: a
+foreign / card-not-present / 03:15 / £4800 transaction scored `0.9945` (flagged), a domestic
+card-present £42 afternoon purchase scored `0.0011` (not flagged), latency 6–13 ms including SHAP.
+The Docker image was built and run; the container returned identical predictions and `/health` was
+ok. Image size 2.16 GB after moving the GCP SDKs to the `gcp` extra (was 2.67 GB).
 
-Global SHAP importance on the sample: `amount_vs_customer_mean` (1.42) > `amount_log` (1.08) ≈
-`amount_sum_24h` (1.08) > `customer_amount_mean_prior` (1.03) > `card_not_present` (0.99). The model
-leans on spend *relative to the customer's own baseline*, which is the desired behaviour.
+Dependency layout changed: `uv sync` = inference only (what Docker installs);
+`uv sync --extra gcp --extra dev` = everything (what CI and local dev need). **The test suite
+requires the `gcp` extra** — `tests/features/test_bigquery.py` constructs real `SchemaField`s.
+Phase 7's CI workflow must use `--extra gcp --extra dev`.
 
-Nothing has been merged to `main` yet — that waits for the first deployable milestone (rule 6).
+Nothing has been merged to `main` yet. Phase 5 is arguably the first deployable milestone, so a
+`develop` → `main` merge is now reasonable — but Phase 7 (CI/CD) is what makes the deploy
+reproducible, so waiting for it is defensible too. **Decision left to the user.**
 
-**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–4 is unit-tested
+**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–5 is unit-tested
 against fakes only. `submit_training_job`, `create_feature_store`, `ensure_dataset`,
-`log_training_run`, `log_global_importance`, and `log_predictions_to_bigquery` have never run
-against the live API — expect small signature corrections on first real invocation. In particular
-`aiplatform.start_run(resume=True)` in `src/evaluation/experiments.py` assumes the run already
-exists from `src/training/experiments.py`; that ordering is untested against the real SDK.
+`ensure_prediction_log`, `log_training_run`, `log_global_importance`, and
+`log_predictions_to_bigquery` have never run against the live API. In particular
+`aiplatform.start_run(resume=True)` assumes the run already exists from
+`src/training/experiments.py`; that ordering is untested against the real SDK.
 
-The `prediction_log` BigQuery table is written by `log_predictions_to_bigquery` but **has no schema
-defined in `src/features/schema.py`** and no `ensure_table` call — `PREDICTIONS_TABLE` is only a name
-constant. Phase 5 must add its schema (transaction_id, variant, fraud_probability, base_value,
-top_features JSON, timestamp) before the audit log can actually be written.
+**Known gaps for later phases:**
+- The inference service does **not yet write to `prediction_log`**. The schema and the writer both
+  exist (`src/evaluation/experiments.py:log_predictions_to_bigquery`) but `app.py` never calls it —
+  wiring it in needs a BigQuery client on the serving path and an async/background write so the
+  request is not blocked. Phase 6 or 7.
+- `InMemoryStateStore` reads the committed CSV. The real `Featurestore` reader satisfying
+  `lookup(customer_id, as_of)` is not written yet.
+- `MAX_RECENT_EVENTS = 100` caps the online event log. `CustomerState.truncated` records when the
+  cap bit; nothing currently alerts on it.
 
-Sample data: 6,000 rows, 2.13% fraud, 35% stealth-fraud cohort. Regenerate with
-`uv run python -m src.features.sample_data`. Artefacts (models + explainers) land in `artifacts/`
-(gitignored).
+Sample data: 6,000 rows, 2.13% fraud, 35% stealth-fraud cohort. Artefacts (models + explainers +
+`metrics.json`) land in `artifacts/` (gitignored) — the Dockerfile copies them in at build time, so
+`docker build` requires a prior training run.
 
-Phase 5 starts with:
-`git checkout develop && git pull && git checkout -b feature/inference-service`
-It will build `src/inference/`: a FastAPI app with typed Pydantic request/response schemas, model +
-explainer loaded once at startup, `/health` and `/predict` (returning probability + SHAP top-k),
-online feature lookup, a Dockerfile targeting Cloud Run, and the A/B traffic-split configuration.
+Phase 6 starts with:
+`git checkout develop && git pull && git checkout -b feature/drift-monitoring`
+It will build `src/monitoring/`: PSI/KS feature-distribution drift against the training reference,
+`importance_shift` on SHAP profiles as a second signal, a Cloud Scheduler-triggered entrypoint, and
+a retraining trigger.
