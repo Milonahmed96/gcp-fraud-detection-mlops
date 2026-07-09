@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 7 complete — CI/CD merged to develop
-Last completed: feature/cicd (.github/workflows/, infrastructure/setup_gcp.sh, 551 tests passing)
-Next task: merge develop → main (first production milestone), then Phase 8 — A/B dashboard
+Phase: Phase 7 complete — CI/CD merged to develop AND to main. CI is green on GitHub.
+Last completed: develop → main merge; GitHub Actions run passes (Lint, Test, Build images); deploy skipped (GCP unconfigured)
+Next task: Phase 8 — A/B dashboard. Tag v1.0.0 after Phase 9 (final polish), not before.
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -113,11 +113,22 @@ CI smoke-test greps (`"status":"ok"`, `"is_flagged":true`) were verified against
 "mirrored into BigQuery". They are not — the writer exists but `app.py` never calls it. The claim
 is now accurate and a **Known limitations** section was added.
 
-**NEXT ACTION: merge `develop` → `main` and tag `v1.0.0`.** This is the first production milestone
-and the workflow now exists to make the deploy reproducible. Note the deploy job will *attempt* to
-run on that merge; it will fail at the `auth` step unless the repo secrets/variables from
-`setup_gcp.sh` are configured. That is expected and harmless (nothing is deployed), but if the user
-wants a clean first run they should either configure the secrets first or let the workflow fail.
+**`develop` → `main` is DONE.** The GitHub Actions run on `main` is green: Lint, Test, and Build
+images all pass, and `Deploy to Cloud Run` is correctly **skipped** because `vars.GCP_PROJECT_ID`
+is unset. Configure the repo secrets/variables below to enable real deploys.
+
+**No tag yet.** The merge commit message says "release: v1.0.0", which is premature — Phase 8
+(dashboard) and Phase 9 (architecture diagram, final cost breakdown) are outstanding deliverables.
+Tag `v1.0.0` at the end of Phase 9, not before. Do not rewrite the pushed `main` history to fix the
+message.
+
+**Two bugs the real CI run found that local testing did not:**
+1. `cache-to: type=gha` fails on buildx's default `docker` driver
+   ("Cache export is not supported for the docker driver"). Fixed by adding
+   `docker/setup-buildx-action@v3` before any cached build, in both workflows. A test now asserts
+   buildx is set up before any step using the GHA cache.
+2. `ruff format --check` failed on `tests/workflows/test_workflows.py` — the pre-merge command run
+   locally used `ruff check` but omitted `ruff format`. **Always run both.**
 
 Required GitHub config (from `setup_gcp.sh` output):
 - Secrets: `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`, `SCHEDULER_SERVICE_ACCOUNT`
