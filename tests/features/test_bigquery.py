@@ -107,6 +107,67 @@ class TestSchemaConversion:
         assert len(names) == len(set(names))
 
 
+class TestTimestampTruncation:
+    """BigQuery TIMESTAMP is microsecond-resolution.
+
+    pyarrow refuses to cast `timestamp[ns]` to `timestamp[us]` and raises
+    `ArrowInvalid: ... would lose data`. The fake client never serialised
+    anything, so this only surfaced on the first live ingestion.
+    """
+
+    def test_nanoseconds_are_floored_to_microseconds(self):
+        frame = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2024-01-01 00:13:20.491923226"]), "amount": [1.0]}
+        )
+        assert frame["timestamp"].iloc[0].nanosecond == 226
+
+        out = bq.truncate_timestamps(frame)
+        assert out["timestamp"].iloc[0].nanosecond == 0
+        assert out["timestamp"].iloc[0] == pd.Timestamp("2024-01-01 00:13:20.491923")
+
+    def test_the_callers_frame_is_not_mutated(self):
+        frame = pd.DataFrame({"timestamp": pd.to_datetime(["2024-01-01 00:00:00.123456789"])})
+        bq.truncate_timestamps(frame)
+        assert frame["timestamp"].iloc[0].nanosecond == 789
+
+    def test_non_datetime_columns_are_untouched(self):
+        frame = pd.DataFrame({"amount": [1.5], "name": ["x"]})
+        pd.testing.assert_frame_equal(bq.truncate_timestamps(frame), frame)
+
+    def test_a_frame_without_datetimes_is_returned_unchanged(self):
+        frame = pd.DataFrame({"a": [1, 2]})
+        assert bq.truncate_timestamps(frame) is frame  # no needless copy
+
+    def test_every_datetime_column_is_floored(self):
+        frame = pd.DataFrame(
+            {
+                "created": pd.to_datetime(["2024-01-01 00:00:00.111111111"]),
+                "updated": pd.to_datetime(["2024-01-01 00:00:00.222222222"]),
+            }
+        )
+        out = bq.truncate_timestamps(frame)
+        assert all(out[c].iloc[0].nanosecond == 0 for c in ("created", "updated"))
+
+    def test_ingestion_floors_timestamps_before_loading(self, config, raw_transactions):
+        """The load path must never hand pyarrow a nanosecond timestamp."""
+        client = FakeClient()
+        nanosecond = raw_transactions.copy()
+        nanosecond["timestamp"] = nanosecond["timestamp"] + pd.Timedelta("123ns")
+
+        bq.ingest_raw_transactions(client, config, nanosecond)
+
+        loaded, _, _ = client.loaded[0]
+        assert (loaded["timestamp"].dt.nanosecond == 0).all()
+
+    def test_the_sample_data_actually_has_nanoseconds(self):
+        """Guards the premise: if the sample lost its nanoseconds, this test file
+        would be asserting nothing."""
+        from src.features.sample_data import load_sample
+
+        sample = load_sample()
+        assert (sample["timestamp"].dt.nanosecond != 0).any()
+
+
 class TestPredictionLog:
     """The audit log table. Phase 4 wrote to it before it had a schema."""
 

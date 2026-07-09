@@ -128,6 +128,39 @@ def ensure_table(
     return table_ref
 
 
+#: BigQuery TIMESTAMP has **microsecond** resolution. It cannot represent
+#: nanoseconds, and pyarrow refuses to truncate silently:
+#:     ArrowInvalid: Casting from timestamp[ns] to timestamp[us, tz=UTC]
+#:                   would lose data: 1704068000491923226
+#: So the truncation has to be ours, and it has to be deliberate.
+BIGQUERY_TIMESTAMP_RESOLUTION = "us"
+
+
+def truncate_timestamps(df: pd.DataFrame) -> pd.DataFrame:
+    """Floor every datetime column to microseconds, BigQuery's actual resolution.
+
+    Not cosmetic. The offline store physically cannot hold nanoseconds, so a
+    frame that round-trips through BigQuery comes back floored. Flooring on the
+    way *in* means the training features computed from BigQuery match the ones
+    computed from the same frame in memory -- if we let pandas keep nanoseconds
+    locally and BigQuery keep microseconds, `seconds_since_prev_txn` would
+    differ between the two by up to a microsecond, which is exactly the
+    train/serve skew `tests/inference/test_skew.py` exists to prevent.
+
+    Returns a copy; the caller's frame is untouched.
+    """
+    datetime_columns = [
+        name for name in df.columns if pd.api.types.is_datetime64_any_dtype(df[name])
+    ]
+    if not datetime_columns:
+        return df
+
+    out = df.copy()
+    for name in datetime_columns:
+        out[name] = out[name].dt.floor(BIGQUERY_TIMESTAMP_RESOLUTION)
+    return out
+
+
 def load_dataframe(
     client: Any,
     config: GCPConfig,
@@ -146,7 +179,9 @@ def load_dataframe(
     table_ref = config.table_ref(table_name)
     job_config = bigquery.LoadJobConfig(schema=schema, write_disposition=write_disposition)
 
-    job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+    job = client.load_table_from_dataframe(
+        truncate_timestamps(df), table_ref, job_config=job_config
+    )
     job.result()  # blocks; raises on failure
     return len(df)
 
