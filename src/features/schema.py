@@ -127,9 +127,37 @@ FEATURE_SPECS: tuple[FieldSpec, ...] = (
 )
 
 
+# The audit log. One row per served prediction, carrying the SHAP attributions
+# that justified it. This is the table a regulator queries: "why was transaction
+# X blocked on date Y?" It is written by src/evaluation/experiments.py and by
+# the inference service.
+PREDICTION_LOG_SCHEMA: tuple[FieldSpec, ...] = (
+    FieldSpec("transaction_id", "STRING", "REQUIRED", "Transaction that was scored"),
+    FieldSpec("customer_id", "STRING", "REQUIRED", "Cardholder the transaction belongs to"),
+    FieldSpec("timestamp", "TIMESTAMP", "REQUIRED", "Time the prediction was served, UTC"),
+    FieldSpec("variant", "STRING", "REQUIRED", "Serving model variant: xgboost or lightgbm"),
+    FieldSpec("fraud_probability", "FLOAT", "REQUIRED", "Predicted probability of fraud"),
+    FieldSpec("threshold", "FLOAT", "REQUIRED", "Decision threshold applied to the probability"),
+    FieldSpec("is_flagged", "BOOLEAN", "REQUIRED", "Whether the transaction was flagged as fraud"),
+    FieldSpec("base_value", "FLOAT", "REQUIRED", "SHAP base value, log-odds space"),
+    FieldSpec(
+        "top_features",
+        "STRING",
+        "REQUIRED",
+        "JSON array of top SHAP attributions; query with JSON_VALUE",
+    ),
+    FieldSpec("latency_ms", "FLOAT", "NULLABLE", "Server-side handler latency in milliseconds"),
+)
+
+
 def feature_names() -> tuple[str, ...]:
     """Ordered names of the engineered features fed to the model."""
     return tuple(spec.name for spec in FEATURE_SPECS)
+
+
+def prediction_log_columns() -> tuple[str, ...]:
+    """Ordered column names of the prediction audit log."""
+    return tuple(spec.name for spec in PREDICTION_LOG_SCHEMA)
 
 
 def raw_column_names() -> tuple[str, ...]:

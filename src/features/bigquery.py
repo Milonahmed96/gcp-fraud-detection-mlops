@@ -20,6 +20,8 @@ from src.features.schema import (
     FEATURE_SPECS,
     FEATURES_TABLE,
     LABEL_COLUMN,
+    PREDICTION_LOG_SCHEMA,
+    PREDICTIONS_TABLE,
     RAW_TRANSACTION_SCHEMA,
     RAW_TRANSACTIONS_TABLE,
     FieldSpec,
@@ -59,6 +61,22 @@ def features_table_schema() -> list[bigquery.SchemaField]:
         if spec.name in {"transaction_id", "customer_id", EVENT_TIMESTAMP_COLUMN, LABEL_COLUMN}
     )
     return to_bigquery_schema(keys + FEATURE_SPECS)
+
+
+def prediction_log_schema() -> list[bigquery.SchemaField]:
+    """Schema of the per-prediction audit log."""
+    return to_bigquery_schema(PREDICTION_LOG_SCHEMA)
+
+
+def ensure_prediction_log(client: Any, config: GCPConfig) -> str:
+    """Create the prediction audit log table if absent. Returns its table ref."""
+    return ensure_table(
+        client,
+        config,
+        PREDICTIONS_TABLE,
+        prediction_log_schema(),
+        cluster_fields=("variant", "customer_id"),
+    )
 
 
 def create_client(config: GCPConfig) -> bigquery.Client:
