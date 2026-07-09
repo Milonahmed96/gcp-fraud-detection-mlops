@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 7 complete — CI/CD merged to develop AND to main. CI is green on GitHub.
-Last completed: develop → main merge; GitHub Actions run passes (Lint, Test, Build images); deploy skipped (GCP unconfigured)
-Next task: Phase 8 — A/B dashboard. Tag v1.0.0 after Phase 9 (final polish), not before.
+Phase: Phase 8 complete — A/B dashboard merged to develop
+Last completed: feature/ab-dashboard (src/evaluation/{report,dashboard}.py, /dashboard route, 604 tests)
+Next task: Phase 9 — final polish (architecture diagram, cost breakdown refresh), then tag v1.0.0
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -17,6 +17,7 @@ Next task: Phase 8 — A/B dashboard. Tag v1.0.0 after Phase 9 (final polish), n
 - [x] PHASE 5 — src/inference/: state, features, schemas, registry, app; Dockerfile; prediction_log schema (+ 97 tests)
 - [x] PHASE 6 — src/monitoring/: drift, monitor, scheduler, app; Dockerfile.monitoring (+ 94 tests)
 - [x] PHASE 7 — .github/workflows/{ci,deploy}.yml, infrastructure/setup_gcp.sh (+ 42 workflow tests)
+- [x] PHASE 8 — src/evaluation/{report,dashboard}.py, GET /dashboard on the monitor (+ 49 tests)
 
 ## Decisions log
 | Decision | Rationale |
@@ -75,6 +76,13 @@ Next task: Phase 8 — A/B dashboard. Tag v1.0.0 after Phase 9 (final polish), n
 | `.github/workflows/*.yml` is parsed and asserted in `tests/workflows/` | A broken workflow is otherwise discovered on push to `main` — the worst possible moment |
 | `concurrency: deploy-main`, `cancel-in-progress: false` | Two racing deploys would leave the traffic split indeterminate |
 | CI provisions the schedule via `python -m src.monitoring.scheduler` | Not a hand-rolled `gcloud scheduler jobs create \|\| update`, so the idempotency the tests cover is the idempotency that runs |
+| Dashboard headline is the **verdict**, not the winner | The interval straddles zero, so the hero reads "No significant difference". A skimming reader must not believe a coin flip was a result |
+| The two SHAP panels share one scale | Per-panel normalisation drew LightGBM's 0.73 as long as XGBoost's 1.43 — a false cross-panel comparison the side-by-side layout invites. Found by rendering the page and looking at it |
+| Ranking metrics and cost get separate charts | Different scales. Never a dual axis |
+| Dashboard is inline SVG, no JS, no CDN | Renders from `file://`, inside a locked-down Cloud Run service, and as an email attachment. Nothing to break, nothing to fetch |
+| Every bar directly labelled + a table view | The aqua series is below 3:1 contrast on the light surface, so colour alone never carries a value |
+| `/dashboard` lives on the **monitor**, not the inference service | It is an operator surface and needs both variants' metrics; an inference revision only knows the variant it serves |
+| Per-variant `importance_<variant>.json` is written at training time | The drift baseline (`reference_importance.json`) is incumbent-only by design; the dashboard compares both |
 
 ## Environment
 - Python 3.11
@@ -148,7 +156,22 @@ the run already exists from `src/training/experiments.py`; untested against the 
 - `MAX_RECENT_EVENTS = 100` caps the online event log; `truncated` is recorded but nothing alerts.
 - Drift monitor compares the whole current batch; no windowing beyond `--start-date`/`--end-date`.
 
-Phase 8 (after the main merge) starts with:
-`git checkout develop && git pull && git checkout -b feature/ab-dashboard`
-A/B test dashboard reading `metrics.json` (and `prediction_log` when it exists): AUC, PR-AUC, F1,
-business cost per 1k with its bootstrap CI, latency, and the SHAP importance profile per variant.
+**Phase 8 done.** `src/evaluation/report.py` loads `metrics.json` + `importance_<variant>.json`;
+`src/evaluation/dashboard.py` renders one self-contained HTML file (inline SVG, no JS, no CDN);
+`GET /dashboard` on the monitoring service serves it. Training now writes per-variant importance.
+Palette validated with a CVD checker (worst adjacent ΔE 73.6, both modes pass).
+
+**Rendered and inspected in a real browser**, which caught two things tests would not have:
+1. The two SHAP panels each normalised to their own max — LightGBM's 0.73 drew as long as
+   XGBoost's 1.43. Now both share one scale, and a test asserts the bar-width ratio.
+2. `LightGBM` wrapped under its swatch in the table (59px row vs 38px). Fixed with `nowrap`.
+
+Phase 9 starts with:
+`git checkout develop && git pull && git checkout -b feature/final-polish`
+- Mermaid + draw.io architecture diagram (`infrastructure/`), reflecting the **two** Cloud Run
+  services (inference + monitor), not one.
+- Refresh the README cost breakdown — it still says "estimates from the pricing page" and has never
+  been checked against the calculator. Either verify or keep the caveat explicit.
+- Update the architecture Mermaid at the top of the README: it predates the monitoring service and
+  the drift-check endpoint.
+- Final `project_context.md` update, then `git tag v1.0.0` on `main`.

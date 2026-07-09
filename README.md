@@ -67,6 +67,7 @@ A rendered `draw.io` XML export lives in `infrastructure/` once Phase 9 complete
 | A/B routing | Cloud Run revision traffic split | Splits live traffic between the XGBoost and LightGBM revisions |
 | Explainability | SHAP (TreeExplainer) | Per-prediction feature attributions, logged for audit |
 | Drift monitoring | Cloud Scheduler + custom job | Daily PSI / KS check against the training reference distribution |
+| A/B dashboard | Inline SVG in a single HTML file | Zero-dependency result page; served at `/dashboard` on the monitor |
 | CI/CD | GitHub Actions | Lint, pytest, build image, deploy to Cloud Run on merge to `main` |
 | Models | XGBoost, LightGBM | The two A/B variants |
 | Language | Python 3.11 | — |
@@ -272,7 +273,25 @@ Two things worth noticing. **LightGBM wins on F1 but loses on cost** — precise
 
 These numbers come from the synthetic sample, whose difficulty is calibrated by a deliberate stealth-fraud cohort (35% of fraud carries no distinguishing signal). That caps achievable recall, which is why ROC-AUC sits near 0.75 rather than 1.0 — an honest ceiling rather than a leaky one.
 
-Results are published to an A/B dashboard (Phase 8).
+### The dashboard
+
+```bash
+uv run python -m src.evaluation.dashboard      # writes artifacts/dashboard.html
+```
+
+Also served at `GET /dashboard` on the drift-monitor service — an operator surface, and it needs *both* variants' metrics, whereas an inference revision only knows the variant it serves.
+
+The page is a single self-contained HTML file: **no JavaScript, no CDN, no chart library**, inline SVG only. It renders from a `file://` URL, inside a locked-down Cloud Run service, and as an email attachment.
+
+Three choices worth defending, because a dashboard that misleads is worse than none:
+
+- **The headline is the verdict, not the winner.** When the interval straddles zero the hero slot reads *"No significant difference"*. A reader who skims must not come away believing a coin flip was a result.
+- **Two scales, two charts — never a dual axis.** Ranking metrics (0–1) and cost per 1,000 (currency) get separate charts.
+- **The two SHAP panels share one scale.** Normalising each panel to its own maximum would have drawn LightGBM's top feature (0.73) as long as XGBoost's (1.43), inviting exactly the cross-panel comparison the side-by-side layout encourages. This was caught by rendering the page and looking at it, not by reading the code.
+
+Every bar carries a direct value label and a table view is provided, because the aqua series sits below 3:1 contrast on the light surface — colour alone never carries a value. The categorical palette was checked with a CVD validator (worst adjacent ΔE 73.6) rather than chosen by eye, and dark mode is a selected set of steps for the dark surface, not an automatic inversion.
+
+The dashboard also states, in its own footer, that its numbers are offline-only and that serving latency is unavailable — see *Known limitations*.
 
 ---
 
@@ -462,7 +481,7 @@ Two footguns worth naming, both caught before they could fail a real deploy:
 | 5 | FastAPI inference service | ✅ Complete |
 | 6 | Drift monitoring | ✅ Complete |
 | 7 | GitHub Actions CI/CD | ✅ Complete |
-| 8 | A/B test dashboard | ⬜ Not started |
+| 8 | A/B test dashboard | ✅ Complete |
 | 9 | Final polish + `v1.0.0` tag | ⬜ Not started |
 
 See `project_context.md` for the live state and decisions log.

@@ -27,8 +27,11 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from src.evaluation.dashboard import render_html
+from src.evaluation.report import ReportError, load_report
 from src.monitoring.drift import DriftError
 from src.monitoring.monitor import DEFAULT_ARTIFACTS_DIR, MonitorError, check_and_maybe_retrain
 
@@ -122,6 +125,22 @@ def create_app() -> FastAPI:
                 detail=f"{profile} not found; run the training job first",
             )
         return {"status": "ok", "source": _source(), "artifacts_dir": str(_artifacts_dir())}
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard() -> HTMLResponse:
+        """The A/B test dashboard.
+
+        Lives on the monitoring service, not the inference service: it is an
+        operator surface, and it reads the whole `metrics.json` (both variants),
+        whereas an inference revision only knows the variant it serves.
+        """
+        try:
+            report = load_report(_artifacts_dir())
+        except ReportError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+            ) from exc
+        return HTMLResponse(render_html(report))
 
     @app.post("/drift-check", response_model=DriftCheckResponse)
     def drift_check(request: Request, body: DriftCheckRequest | None = None) -> DriftCheckResponse:

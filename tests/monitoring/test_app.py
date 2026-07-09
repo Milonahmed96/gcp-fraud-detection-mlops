@@ -32,6 +32,34 @@ class TestHealth:
             assert "reference_profile.json" in response.json()["detail"]
 
 
+class TestDashboard:
+    """The A/B dashboard lives on the monitoring service, not the inference API:
+    it is an operator surface and it reads both variants' metrics, whereas an
+    inference revision only knows the variant it serves."""
+
+    def test_serves_html(self, client):
+        response = client.get("/dashboard")
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert response.text.startswith("<!doctype html>")
+
+    def test_renders_the_verdict(self, client):
+        assert "No significant difference" in client.get("/dashboard").text
+
+    def test_is_self_contained(self, client):
+        """No CDN, no script: it must render inside a locked-down service."""
+        body = client.get("/dashboard").text
+        assert "<script" not in body
+        assert "https://" not in body
+
+    def test_503_without_metrics(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MODEL_ARTIFACTS_DIR", str(tmp_path))
+        with TestClient(create_app(), raise_server_exceptions=False) as broken:
+            response = broken.get("/dashboard")
+            assert response.status_code == 503
+            assert "metrics.json" in response.json()["detail"]
+
+
 class TestDriftCheck:
     def test_an_empty_body_runs_the_check(self, client):
         """Cloud Scheduler posts no body."""
