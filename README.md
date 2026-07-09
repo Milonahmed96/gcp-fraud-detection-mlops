@@ -241,10 +241,32 @@ Results are published to an A/B dashboard (Phase 8).
 
 Regulated lenders must be able to explain adverse automated decisions. Every prediction returns, alongside its fraud probability, the top contributing features and their signed SHAP attributions.
 
-- `shap.TreeExplainer` is used for both variants — exact for tree ensembles and fast enough to sit in the request path
-- The explainer is built once at training time and shipped as a model artefact, so no explainer construction happens per request
+- `shap.TreeExplainer` is used for both variants — exact for tree ensembles and fast enough to sit in the request path. Both A/B variants being tree ensembles is a genuine constraint on the variant choice, not a coincidence
+- The explainer is built once at training time and shipped as a model artefact (`artifacts/explainer_<variant>.joblib`), so no explainer construction happens per request
 - Per-prediction attributions are logged to **Vertex AI Experiments** and mirrored into **BigQuery**, giving a queryable audit trail: *why* was transaction `X` blocked on date `Y`?
-- Global feature importance (mean absolute SHAP) is recomputed each training run and compared against the previous run — a large shift in what drives the model is itself a drift signal
+- Global feature importance (mean absolute SHAP) is recomputed each training run and compared against the previous run via `importance_shift` — a large shift in what drives the model is itself a drift signal, and Phase 6's monitor watches it alongside the feature distributions
+
+### Two things the implementation gets right
+
+**Attributions live in log-odds space, not probability space.** SHAP's additivity guarantee is `base_value + Σ shap_values == raw margin` (the ensemble's pre-sigmoid output). Summing attributions and expecting a probability is a common, silent error. `Explanation` names the space it is in, and `verify_additivity` asserts the identity to a `1e-4` tolerance against the model's own raw margin.
+
+**The shape of `shap_values` is not stable across shap versions or model types.** Some releases return a two-element list (one array per class) for LightGBM binary classifiers; some return `(n, n_features, 2)`; current ones return `(n, n_features)`. Taking the wrong element inverts the sign of every explanation and *nothing raises*. `normalise_shap_values` collapses all three shapes onto the positive class, and the test suite covers each.
+
+### Example: a real explanation
+
+For the highest-scoring true fraud in the test set (`p = 0.999`):
+
+| Feature | Value | SHAP | Direction |
+|---|---|---|---|
+| `is_foreign` | 1.00 | **+2.682** | toward fraud |
+| `amount_vs_customer_mean` | 4.16 | **+2.252** | toward fraud |
+| `card_not_present` | 1.00 | **+1.539** | toward fraud |
+| `amount_sum_24h` | 226.05 | −0.782 | toward genuine |
+| `day_of_week` | 1.00 | −0.631 | toward genuine |
+
+A foreign, card-not-present transaction at 4.16× that customer's own spending baseline. Note that exculpatory features are surfaced too — `top_contributions` ranks by *absolute* effect, because an auditor asking "why was this blocked?" needs the evidence that argued against the decision as well.
+
+Globally, `amount_vs_customer_mean` is the strongest driver (mean |SHAP| 1.42), ahead of `amount_log` (1.08) and `amount_sum_24h` (1.08) — the model relies most on spending *relative to the customer's own baseline* rather than on raw transaction size, which is the behaviour a fraud analyst would want.
 
 ---
 
@@ -275,7 +297,7 @@ Authentication uses **Workload Identity Federation** — GitHub Actions assumes 
 | 1 | Repository scaffold + documentation | ✅ Complete |
 | 2 | Data ingestion + feature engineering | ✅ Complete |
 | 3 | Model training on Vertex AI | ✅ Complete |
-| 4 | SHAP explainability module | ⬜ Not started |
+| 4 | SHAP explainability module | ✅ Complete |
 | 5 | FastAPI inference service | ⬜ Not started |
 | 6 | Drift monitoring | ⬜ Not started |
 | 7 | GitHub Actions CI/CD | ⬜ Not started |

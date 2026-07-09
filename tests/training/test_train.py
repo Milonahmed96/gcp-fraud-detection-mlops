@@ -165,6 +165,50 @@ class TestCompareVariants:
 
     def test_skips_artefacts_without_an_output_dir(self, comparison):
         assert all(r.model_path is None for r in comparison.results.values())
+        assert all(r.explainer_path is None for r in comparison.results.values())
+
+
+class TestExplainerArtefacts:
+    """The SHAP explainer must be built at training time, not per request."""
+
+    def test_an_explainer_is_saved_beside_every_model(self, dataset, tmp_path):
+        result = compare_variants(dataset, output_dir=tmp_path, n_resamples=10)
+        for variant in VARIANTS:
+            assert (tmp_path / f"explainer_{variant}.joblib").exists()
+            assert result.results[variant].explainer_path is not None
+
+    def test_the_saved_explainer_explains_the_saved_model(self, dataset, tmp_path):
+        """A reloaded explainer must agree with its reloaded model, or the
+        inference service will serve explanations for a different model."""
+        from src.evaluation.explainer import FraudExplainer
+
+        compare_variants(dataset, output_dir=tmp_path, n_resamples=10)
+        explainer = FraudExplainer.load(tmp_path / "explainer_xgboost.joblib")
+        model = joblib.load(tmp_path / "model_xgboost.joblib")
+
+        rows = dataset.test.X.head(5)
+        np.testing.assert_allclose(
+            [e.probability for e in explainer.explain(rows)],
+            predict_fraud_probability(model, rows),
+            rtol=1e-6,
+        )
+
+    def test_the_saved_explainer_knows_the_real_feature_names(self, dataset, tmp_path):
+        from src.evaluation.explainer import FraudExplainer
+        from src.features.schema import feature_names
+
+        compare_variants(dataset, output_dir=tmp_path, n_resamples=10)
+        explainer = FraudExplainer.load(tmp_path / "explainer_lightgbm.joblib")
+        assert explainer.feature_names == list(feature_names())
+
+    def test_shap_additivity_holds_on_the_real_trained_model(self, dataset, tmp_path):
+        from src.evaluation.explainer import FraudExplainer
+
+        compare_variants(dataset, output_dir=tmp_path, n_resamples=10)
+        explainer = FraudExplainer.load(tmp_path / "explainer_xgboost.joblib")
+        rows = dataset.test.X.head(50)
+        margins = explainer.model.predict(rows, output_margin=True)
+        explainer.verify_additivity(rows, margins)
 
 
 class TestRunLocalTraining:

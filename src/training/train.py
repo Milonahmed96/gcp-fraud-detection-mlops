@@ -60,6 +60,7 @@ class TrainingResult:
     n_test: int
     train_fraud_rate: float
     model_path: str | None = None
+    explainer_path: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -150,6 +151,19 @@ def save_model(model: FittedModel, variant: str, output_dir: Path) -> Path:
     return path
 
 
+def save_explainer(model: FittedModel, variant: str, dataset: Dataset, output_dir: Path) -> Path:
+    """Build the SHAP explainer once at training time and ship it as an artefact.
+
+    Constructing a `TreeExplainer` per request would put tree traversal on the
+    hot path. Building it here and persisting it means the inference service
+    loads it alongside the model.
+    """
+    from src.evaluation.explainer import FraudExplainer
+
+    explainer = FraudExplainer.from_model(model, list(dataset.train.X.columns))
+    return explainer.save(output_dir / f"explainer_{variant}.joblib")
+
+
 def compare_variants(
     dataset: Dataset,
     *,
@@ -175,8 +189,11 @@ def compare_variants(
         results[variant] = result
         scores[variant] = predict_fraud_probability(model, dataset.test.X)
         if output_dir is not None:
-            path = save_model(model, variant, output_dir)
-            results[variant] = replace(result, model_path=str(path))
+            model_path = save_model(model, variant, output_dir)
+            explainer_path = save_explainer(model, variant, dataset, output_dir)
+            results[variant] = replace(
+                result, model_path=str(model_path), explainer_path=str(explainer_path)
+            )
 
     a, b = VARIANTS  # xgboost, lightgbm
     point, low, high = bootstrap_cost_difference(

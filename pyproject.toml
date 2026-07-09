@@ -18,6 +18,10 @@ dependencies = [
     "xgboost>=2.1",
     "lightgbm>=4.5",
     "joblib>=1.4",
+    "shap>=0.46",
+    # shap pulls in numba -> llvmlite. Without a floor, the resolver backtracks
+    # to llvmlite 0.36, which refuses to build on Python 3.11.
+    "numba>=0.60",
 ]
 
 [project.optional-dependencies]
