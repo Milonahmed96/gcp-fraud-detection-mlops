@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 8 complete — A/B dashboard merged to develop
-Last completed: feature/ab-dashboard (src/evaluation/{report,dashboard}.py, /dashboard route, 604 tests)
-Next task: Phase 9 — final polish (architecture diagram, cost breakdown refresh), then tag v1.0.0
+Phase: **ALL 9 PHASES COMPLETE.** v1.0.0 tagged on main. CI green on GitHub.
+Last completed: feature/final-polish (architecture diagram, verified cost breakdown, Feature Store deprecation notice)
+Next task: none required. Optional follow-ups listed under "Outstanding work" below.
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -18,6 +18,7 @@ Next task: Phase 9 — final polish (architecture diagram, cost breakdown refres
 - [x] PHASE 6 — src/monitoring/: drift, monitor, scheduler, app; Dockerfile.monitoring (+ 94 tests)
 - [x] PHASE 7 — .github/workflows/{ci,deploy}.yml, infrastructure/setup_gcp.sh (+ 42 workflow tests)
 - [x] PHASE 8 — src/evaluation/{report,dashboard}.py, GET /dashboard on the monitor (+ 49 tests)
+- [x] PHASE 9 — architecture diagram (Mermaid + draw.io), verified cost breakdown, README polish, v1.0.0 tag
 
 ## Decisions log
 | Decision | Rationale |
@@ -83,6 +84,9 @@ Next task: Phase 9 — final polish (architecture diagram, cost breakdown refres
 | Every bar directly labelled + a table view | The aqua series is below 3:1 contrast on the light surface, so colour alone never carries a value |
 | `/dashboard` lives on the **monitor**, not the inference service | It is an operator surface and needs both variants' metrics; an inference revision only knows the variant it serves |
 | Per-variant `importance_<variant>.json` is written at training time | The drift baseline (`reference_importance.json`) is incumbent-only by design; the dashboard compares both |
+| Architecture diagram draws unimplemented paths as **dashed** | A diagram that draws intent as fact is a lie with better typography. `prediction_log` writes and the Feature Store online lookup are dashed |
+| Cost breakdown splits "verified against docs" from "estimated" | Cloud Run / BigQuery / Scheduler free tiers were fetched from Google's docs. The `n1-standard-4` and Feature Store node-hour rates could **not** be extracted (JS-rendered pages) and are labelled as unverified |
+| `feature_store.py` targets a **deprecated** API, and this is documented rather than silently fixed | `aiplatform.Featurestore` is Vertex AI Feature Store (Legacy); Optimized online serving sunsets 2027-02-17, migration path is Bigtable. Rewriting it blind, with no GCP project to test against, would trade a documented gap for an unverifiable one |
 
 ## Environment
 - Python 3.11
@@ -95,83 +99,74 @@ Next task: Phase 9 — final polish (architecture diagram, cost breakdown refres
 - Cloud Run region: europe-west2 (London) preferred
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
-## Session handoff notes
-Phase 7 finished. `develop` carries `.github/workflows/ci.yml` (lint, tests, build **and run** both
-containers), `.github/workflows/deploy.yml` (WIF auth, push to Artifact Registry, two no-traffic
-revisions, smoke test, traffic split, monitor + scheduler), `infrastructure/setup_gcp.sh` (one-time
-idempotent bootstrap, creates no keys), and `tests/workflows/` (42 tests parsing the YAML and
-asserting the invariants). `src/monitoring/scheduler.py` gained a CLI so CI provisions the schedule
-through tested code. 551 tests pass; ruff is clean.
+## Final state
 
-**Verified before shipping:** `Dockerfile.monitoring` was built (2.67 GB, correctly carries the gcp
-extra) and its container serves `/health` and `POST /drift-check`. Every `run:` block in both
-workflows was extracted and passed through `bash -n`. The `jq -er` tagged-URL extraction was tested
-against a realistic Cloud Run `describe` payload and confirmed to exit non-zero on a missing tag. The
-CI smoke-test greps (`"status":"ok"`, `"is_flagged":true`) were verified against real server output.
+**All nine phases complete.** `main` and `develop` are level; `v1.0.0` is tagged on `main`.
+604 tests pass; GitHub Actions is green (Lint, Test, Build images). The deploy job skips cleanly
+until GCP is configured.
 
-**Two footguns fixed before they could fail a real deploy:**
-1. `gcloud auth print-identity-token` does **not** work under Workload Identity Federation — a
-   federated credential cannot mint an ID token. The smoke test now impersonates the deployer SA
-   with `--audiences=<exact URL>`, and `setup_gcp.sh` grants it `serviceAccountTokenCreator` on
-   itself. Without that binding the smoke test 403s and nothing ever deploys.
-2. The original `--format="...extract(url)"` projection for the tagged revision URL was fragile;
-   replaced with `jq -er`.
+### What exists
+- `src/features/` — env-driven config, the shared schema contract, causal feature engineering,
+  BigQuery offline store, Feature Store (legacy API), deterministic synthetic sample data.
+- `src/training/` — business cost metric + bootstrap CI, temporal split, two capacity-matched
+  variants, train CLI with `--backend local|vertex`, Vertex submission, Experiments logging.
+- `src/evaluation/` — SHAP explainer (version-stable class-axis handling, additivity check),
+  experiment/BigQuery logging, A/B report loader, self-contained HTML dashboard.
+- `src/inference/` — causal `CustomerState`, serving features with zero train/serve skew, Pydantic
+  contract, artefact registry (trained threshold), FastAPI app. `Dockerfile` → 2.16 GB.
+- `src/monitoring/` — PSI/KS drift, scheduled check + retraining trigger, idempotent Cloud Scheduler
+  job, drift-monitor Cloud Run service serving `/drift-check` and `/dashboard`.
+  `Dockerfile.monitoring` → 2.67 GB (carries the gcp extra).
+- `.github/workflows/` — PR gate (lint, tests, build **and run** both containers) and a deploy that
+  never shifts traffic to an unsmoke-tested revision. WIF, no keys.
+- `infrastructure/` — `setup_gcp.sh` (one-time bootstrap) and `architecture.drawio`.
 
-**README corrected, not just extended.** It previously claimed per-prediction attributions were
-"mirrored into BigQuery". They are not — the writer exists but `app.py` never calls it. The claim
-is now accurate and a **Known limitations** section was added.
+### Verified behaviour (not just unit-tested)
+- Inference: fraud 0.9945 flagged, genuine 0.0011 not flagged, 6–13 ms including SHAP. Verified via
+  uvicorn and inside the Docker container.
+- Drift: quiet against its own training distribution (worst PSI 0.0113); a simulated fraud ring
+  produced `DRIFT: 6/13 features, is_foreign psi=15.40`.
+- Dashboard: rendered in a real browser; shared-scale bug and a table-wrap bug found that way.
+- Mermaid diagram: rendered with mermaid v11 (14 nodes, 20 edges, 5 subgraphs), no parse errors.
+- CI: green on GitHub for both `develop` and `main`.
 
-**`develop` → `main` is DONE.** The GitHub Actions run on `main` is green: Lint, Test, and Build
-images all pass, and `Deploy to Cloud Run` is correctly **skipped** because `vars.GCP_PROJECT_ID`
-is unset. Configure the repo secrets/variables below to enable real deploys.
+### The A/B result
+XGBoost cost/1k = 984.69, LightGBM = 1017.40, delta `-32.71 [-143.96, +29.17]` — **not significant**.
+LightGBM wins F1 (0.452 vs 0.444) and loses on cost. The incumbent is kept. This is the intended,
+honest outcome, not a failure to find a winner.
 
-**No tag yet.** The merge commit message says "release: v1.0.0", which is premature — Phase 8
-(dashboard) and Phase 9 (architecture diagram, final cost breakdown) are outstanding deliverables.
-Tag `v1.0.0` at the end of Phase 9, not before. Do not rewrite the pushed `main` history to fix the
-message.
+## Outstanding work (all documented in README > Known limitations)
 
-**Two bugs the real CI run found that local testing did not:**
-1. `cache-to: type=gha` fails on buildx's default `docker` driver
-   ("Cache export is not supported for the docker driver"). Fixed by adding
-   `docker/setup-buildx-action@v3` before any cached build, in both workflows. A test now asserts
-   buildx is set up before any step using the GHA cache.
-2. `ruff format --check` failed on `tests/workflows/test_workflows.py` — the pre-merge command run
-   locally used `ruff check` but omitted `ruff format`. **Always run both.**
+1. **No GCP resource has ever been provisioned.** Every cloud call is tested against a fake client.
+   `submit_training_job`, `create_feature_store`, `ensure_dataset`, `ensure_prediction_log`,
+   `log_training_run`, `log_global_importance`, `log_predictions_to_bigquery`,
+   `ensure_drift_check_job` have never run live. Run `infrastructure/setup_gcp.sh`, set the repo
+   secrets/variables, and expect small signature corrections on the first real invocation.
+2. **`src/features/feature_store.py` uses Vertex AI Feature Store (Legacy).** Optimized online
+   serving sunsets **2027-02-17**; the migration path is Bigtable online serving, or Feature Store as
+   a metadata layer over BigQuery. Breaks nothing today because serving does not call it.
+3. **The serving path does not write to `prediction_log`.** Schema and writer exist. The clean fix is
+   structured logging to Cloud Logging + a BigQuery sink — no SDK on the serving path, no latency.
+   Until then the dashboard shows offline metrics only and no serving latency.
+4. **`InMemoryStateStore` reads the committed CSV.** The real Featurestore reader satisfying
+   `lookup(customer_id, as_of)` is unwritten.
+5. `MAX_RECENT_EVENTS = 100` caps the online event log; `CustomerState.truncated` records when the
+   cap bit, but nothing alerts on it.
+6. Drift monitor compares the whole batch; no windowing beyond `--start-date`/`--end-date`.
+7. `aiplatform.start_run(resume=True)` assumes the training run already exists — untested ordering.
 
-Required GitHub config (from `setup_gcp.sh` output):
+## Required GitHub configuration to enable deploys
 - Secrets: `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`, `SCHEDULER_SERVICE_ACCOUNT`
 - Variables: `GCP_PROJECT_ID`, `GCP_REGION`, `ARTIFACT_REPOSITORY`, `GCP_BUCKET_NAME`,
   `BIGQUERY_DATASET`, `FEATURE_STORE_ID`
-- An `environment: production` must exist (deploy.yml targets it).
+- An `environment: production` must exist. `deploy.yml` skips entirely while `GCP_PROJECT_ID` is unset.
 
-**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–7 is unit-tested
-against fakes only. `aiplatform.start_run(resume=True)` in `src/evaluation/experiments.py` assumes
-the run already exists from `src/training/experiments.py`; untested against the real SDK.
-
-**Known gaps, carried forward (also listed in README > Known limitations):**
-- The inference service still does **not write to `prediction_log`**. So the Phase 8 A/B dashboard
-  has **no production prediction data** and must read `artifacts/metrics.json`. The clean fix is
-  structured logging to Cloud Logging + a BigQuery sink (no SDK on the serving path, no latency).
-- `InMemoryStateStore` reads the committed CSV; the real Featurestore reader is unwritten.
-- `MAX_RECENT_EVENTS = 100` caps the online event log; `truncated` is recorded but nothing alerts.
-- Drift monitor compares the whole current batch; no windowing beyond `--start-date`/`--end-date`.
-
-**Phase 8 done.** `src/evaluation/report.py` loads `metrics.json` + `importance_<variant>.json`;
-`src/evaluation/dashboard.py` renders one self-contained HTML file (inline SVG, no JS, no CDN);
-`GET /dashboard` on the monitoring service serves it. Training now writes per-variant importance.
-Palette validated with a CVD checker (worst adjacent ΔE 73.6, both modes pass).
-
-**Rendered and inspected in a real browser**, which caught two things tests would not have:
-1. The two SHAP panels each normalised to their own max — LightGBM's 0.73 drew as long as
-   XGBoost's 1.43. Now both share one scale, and a test asserts the bar-width ratio.
-2. `LightGBM` wrapped under its swatch in the table (59px row vs 38px). Fixed with `nowrap`.
-
-Phase 9 starts with:
-`git checkout develop && git pull && git checkout -b feature/final-polish`
-- Mermaid + draw.io architecture diagram (`infrastructure/`), reflecting the **two** Cloud Run
-  services (inference + monitor), not one.
-- Refresh the README cost breakdown — it still says "estimates from the pricing page" and has never
-  been checked against the calculator. Either verify or keep the caveat explicit.
-- Update the architecture Mermaid at the top of the README: it predates the monitoring service and
-  the drift-check endpoint.
-- Final `project_context.md` update, then `git tag v1.0.0` on `main`.
+## Reproducing everything locally
+```
+uv sync --extra gcp --extra dev
+uv run pytest                                          # 604 tests
+uv run python -m src.training.train --backend local    # writes artifacts/
+uv run python -m src.evaluation.dashboard              # writes artifacts/dashboard.html
+uv run python -m src.monitoring.monitor --source sample --dry-run
+uv run uvicorn src.inference.app:app --port 8080
+```
