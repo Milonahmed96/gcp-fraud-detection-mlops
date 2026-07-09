@@ -168,6 +168,28 @@ def save_explainer(model: FittedModel, variant: str, dataset: Dataset, output_di
     return explainer.save(output_dir / f"explainer_{variant}.joblib")
 
 
+def save_variant_importance(
+    model: FittedModel, variant: str, dataset: Dataset, output_dir: Path
+) -> Path:
+    """Persist this variant's SHAP importance profile for the A/B dashboard.
+
+    Distinct from `save_drift_reference`, which captures only the *incumbent's*
+    profile as the drift baseline. The dashboard compares both variants, so each
+    needs its own.
+    """
+    import json as _json
+
+    from src.evaluation.explainer import FraudExplainer
+
+    explainer = FraudExplainer.from_model(model, list(dataset.train.X.columns))
+    importance = explainer.global_importance(dataset.train.X.head(IMPORTANCE_PROFILE_ROWS))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"importance_{variant}.json"
+    path.write_text(_json.dumps({k: float(v) for k, v in importance.items()}, indent=2))
+    return path
+
+
 def save_drift_reference(model: FittedModel, dataset: Dataset, output_dir: Path) -> None:
     """Capture the training feature distribution and SHAP importance profile.
 
@@ -214,6 +236,7 @@ def compare_variants(
         if output_dir is not None:
             model_path = save_model(model, variant, output_dir)
             explainer_path = save_explainer(model, variant, dataset, output_dir)
+            save_variant_importance(model, variant, dataset, output_dir)
             results[variant] = replace(
                 result, model_path=str(model_path), explainer_path=str(explainer_path)
             )
