@@ -282,7 +282,8 @@ Regulated lenders must be able to explain adverse automated decisions. Every pre
 
 - `shap.TreeExplainer` is used for both variants — exact for tree ensembles and fast enough to sit in the request path. Both A/B variants being tree ensembles is a genuine constraint on the variant choice, not a coincidence
 - The explainer is built once at training time and shipped as a model artefact (`artifacts/explainer_<variant>.joblib`), so no explainer construction happens per request
-- Per-prediction attributions are logged to **Vertex AI Experiments** and mirrored into **BigQuery**, giving a queryable audit trail: *why* was transaction `X` blocked on date `Y`?
+- Per-prediction attributions are returned in the `/predict` response, and global importance per training run is logged to **Vertex AI Experiments**
+- A **BigQuery `prediction_log`** table and its writer exist for the queryable audit trail — *why was transaction `X` blocked on date `Y`?* — but the serving path does **not yet call it**. Wiring that write requires a non-blocking background task so the request is not delayed; see *Known limitations*
 - Global feature importance (mean absolute SHAP) is recomputed each training run and compared against the previous run via `importance_shift` — a large shift in what drives the model is itself a drift signal, and Phase 6's monitor watches it alongside the feature distributions
 
 ### Two things the implementation gets right
@@ -414,21 +415,39 @@ A retraining submission failure is logged, never raised: a 5xx would make Cloud 
 
 ## CI/CD
 
-`.github/workflows/` defines the pipeline (Phase 7):
+Two workflows. `ci.yml` is the PR gate; `deploy.yml` calls it as a reusable workflow, so **`main` can never deploy code that has not passed the same gate a pull request does.**
 
-**On pull request into `develop`:**
-1. `ruff check` + `ruff format --check` — lint and format gates
-2. `uv run pytest` — full unit and integration suite
-3. Docker build (build-only, no push) — proves the image still assembles
+**`ci.yml` — on PR into `develop` or `main`:**
+1. `ruff check` + `ruff format --check`
+2. Full pytest suite (installs `--extra gcp`; without it the suite cannot import `bigquery.SchemaField`)
+3. Train the models — both Dockerfiles `COPY artifacts/`, so the images cannot be built without a training run
+4. Build both images (no push)
+5. **Run both containers and hit them.** `/health` must return `"status":"ok"`, and `/predict` must flag a known-fraudulent transaction. Proving an image *assembles* is not proving it *serves*.
 
-**On merge to `main`:**
-1. Everything above
-2. Build and push the image to Artifact Registry, tagged with the commit SHA
-3. `gcloud run deploy` to Cloud Run in `europe-west2`
-4. Smoke-test the new revision's `/health` endpoint before shifting traffic
-5. Shift traffic per the configured A/B split; roll back automatically if the smoke test fails
+**`deploy.yml` — on merge to `main`:**
+1. Everything above, via `workflow_call`
+2. Build and push both images to Artifact Registry, tagged with the commit SHA
+3. Deploy **two revisions** of the inference service — one per A/B variant, differing only in `SERVING_VARIANT` — both with `--no-traffic`
+4. Smoke-test each revision on its own `--tag` URL, which receives no production traffic
+5. Only then `update-traffic --to-tags=xgb=50,lgbm=50`
+6. Deploy the drift monitor and provision its Cloud Scheduler job
 
-Authentication uses **Workload Identity Federation** — GitHub Actions assumes a GCP service account via OIDC. No service-account JSON key is ever stored in the repository or in GitHub secrets.
+### The rollback strategy is the ordering
+
+There is no rollback step, because traffic never moves until the smoke test passes. If a new revision is unhealthy the job stops at step 4 and the previous revision continues serving 100%. A rollback you never have to execute is the only kind that reliably works.
+
+`concurrency: deploy-main` with `cancel-in-progress: false` prevents two deploys racing for the same traffic split.
+
+### No keys, anywhere
+
+Authentication is **Workload Identity Federation**: GitHub Actions presents its OIDC token and GCP mints short-lived credentials. No service-account JSON key exists in the repository, in GitHub secrets, or on disk. `infrastructure/setup_gcp.sh` bootstraps this once, and its WIF provider carries an `attribute-condition` pinning it to this repository — without that condition, *any* GitHub repo on the internet could mint tokens for the service account.
+
+Two footguns worth naming, both caught before they could fail a real deploy:
+
+- **A federated credential cannot mint an ID token.** `gcloud auth print-identity-token` on its own fails under WIF, so the smoke test against the private Cloud Run service would 403 on every deploy. It impersonates the deployer service account (which holds `serviceAccountTokenCreator` on itself) and passes `--audiences` set to the exact URL being called.
+- **Cloud Scheduler's OIDC audience must be the bare service URL**, not the URL with `/drift-check` appended, or Cloud Run rejects the token.
+
+`tests/workflows/test_workflows.py` parses both YAML files and asserts these invariants — no `credentials_json`, `id-token: write` present, deploy `needs: verify`, smoke-test index before `update-traffic`, every action pinned rather than floating on `@main`. A broken workflow should fail the test suite, not the deploy.
 
 ---
 
@@ -442,11 +461,25 @@ Authentication uses **Workload Identity Federation** — GitHub Actions assumes 
 | 4 | SHAP explainability module | ✅ Complete |
 | 5 | FastAPI inference service | ✅ Complete |
 | 6 | Drift monitoring | ✅ Complete |
-| 7 | GitHub Actions CI/CD | ⬜ Not started |
+| 7 | GitHub Actions CI/CD | ✅ Complete |
 | 8 | A/B test dashboard | ⬜ Not started |
 | 9 | Final polish + `v1.0.0` tag | ⬜ Not started |
 
 See `project_context.md` for the live state and decisions log.
+
+---
+
+## Known limitations
+
+Stated plainly, because a portfolio project that hides its gaps teaches the reader nothing.
+
+- **No GCP resource has ever been provisioned.** Every cloud call — Vertex AI training submission, Feature Store creation, BigQuery table provisioning, Cloud Scheduler jobs — is unit-tested against a fake client. None has run against a live project. The code is written to the documented APIs and the deploy workflow is syntax-checked, but expect small signature corrections on the first real run. `infrastructure/setup_gcp.sh` is the entry point.
+- **The serving path does not write to `prediction_log`.** The table schema and the writer both exist and are tested; `app.py` never calls them. Doing so needs a BigQuery client on the serving path and a background write so latency is unaffected — and the inference image deliberately excludes the BigQuery SDK, so the cleaner route is structured logging to Cloud Logging with a BigQuery sink.
+- **The A/B result on the sample is not statistically significant.** XGBoost costs less per 1,000 transactions than LightGBM, but the bootstrap interval straddles zero. The pipeline reports this honestly and keeps the incumbent rather than shipping a coin flip.
+- **`InMemoryStateStore` reads the committed CSV.** The real Vertex AI Feature Store reader satisfying `lookup(customer_id, as_of)` is not written. The interface exists so the swap is local.
+- **The drift monitor compares the whole current batch** against the reference; windowing beyond `--start-date`/`--end-date` is not implemented.
+- **Training data is synthetic.** Real fraud data is not publicly distributable at useful fidelity. The generator injects realistic correlations *and* a 35% stealth-fraud cohort that caps achievable recall, which is why ROC-AUC sits near 0.75 rather than an implausible 1.0.
+- **Cost figures are estimates** from GCP's published pricing, not from a metered bill.
 
 ---
 

@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 6 complete — drift monitoring merged to develop
-Last completed: feature/drift-monitoring (src/monitoring/ built, 509 tests passing, endpoint driven live)
-Next task: Phase 7 — GitHub Actions CI/CD (.github/workflows/deploy.yml), then develop → main + tag
+Phase: Phase 7 complete — CI/CD merged to develop
+Last completed: feature/cicd (.github/workflows/, infrastructure/setup_gcp.sh, 551 tests passing)
+Next task: merge develop → main (first production milestone), then Phase 8 — A/B dashboard
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -16,6 +16,7 @@ Next task: Phase 7 — GitHub Actions CI/CD (.github/workflows/deploy.yml), then
 - [x] PHASE 4 — src/evaluation/: explainer (SHAP), experiments (Vertex + BigQuery audit log) (+ 78 tests)
 - [x] PHASE 5 — src/inference/: state, features, schemas, registry, app; Dockerfile; prediction_log schema (+ 97 tests)
 - [x] PHASE 6 — src/monitoring/: drift, monitor, scheduler, app; Dockerfile.monitoring (+ 94 tests)
+- [x] PHASE 7 — .github/workflows/{ci,deploy}.yml, infrastructure/setup_gcp.sh (+ 42 workflow tests)
 
 ## Decisions log
 | Decision | Rationale |
@@ -66,6 +67,14 @@ Next task: Phase 7 — GitHub Actions CI/CD (.github/workflows/deploy.yml), then
 | `ensure_drift_check_job` creates-or-updates | A redeploy must not fail with `AlreadyExists`, nor leave a stale schedule behind |
 | A retraining submission failure is logged, not raised | A 5xx makes Cloud Scheduler retry → a thundering herd of Vertex AI training jobs. The check already did its job by reporting drift |
 | `scipy` declared explicitly despite arriving via scikit-learn | `drift.py` imports `ks_2samp` directly. Relying on a transitive dependency is a trap |
+| `deploy.yml` calls `ci.yml` via `workflow_call` | `main` must never deploy code that has not passed the same gate a PR does |
+| New revisions deploy with `--no-traffic`, smoke-tested on their `--tag` URL, then traffic shifts | The ordering *is* the rollback strategy. If the smoke test fails, the job stops and the previous revision keeps 100%. A rollback you never execute is the only kind that reliably works |
+| Smoke test impersonates the deployer SA with `--audiences` to mint an ID token | A Workload Identity *federated* credential cannot mint an ID token. Bare `gcloud auth print-identity-token` would 403 against the private service on every deploy. Requires `serviceAccountTokenCreator` on itself |
+| WIF provider carries `attribute-condition` pinning `assertion.repository` | Without it, *any* GitHub repository could mint tokens for the deployer service account |
+| CI smoke-tests the running containers, not just `docker build` | Proving an image assembles is not proving it serves. The greps (`"status":"ok"`, `"is_flagged":true`) were verified against real output |
+| `.github/workflows/*.yml` is parsed and asserted in `tests/workflows/` | A broken workflow is otherwise discovered on push to `main` — the worst possible moment |
+| `concurrency: deploy-main`, `cancel-in-progress: false` | Two racing deploys would leave the traffic split indeterminate |
+| CI provisions the schedule via `python -m src.monitoring.scheduler` | Not a hand-rolled `gcloud scheduler jobs create \|\| update`, so the idempotency the tests cover is the idempotency that runs |
 
 ## Environment
 - Python 3.11
@@ -79,51 +88,56 @@ Next task: Phase 7 — GitHub Actions CI/CD (.github/workflows/deploy.yml), then
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
 ## Session handoff notes
-Phase 6 finished. `develop` carries `src/monitoring/`: `drift.py` (PSI + KS, `ReferenceProfile`),
-`monitor.py` (`check_and_maybe_retrain`, CLI), `scheduler.py` (idempotent Cloud Scheduler job),
-`app.py` (drift-check Cloud Run service), plus `Dockerfile.monitoring`. `train.py` now also writes
-`reference_profile.json` and `reference_importance.json`. 509 tests pass; ruff is clean.
+Phase 7 finished. `develop` carries `.github/workflows/ci.yml` (lint, tests, build **and run** both
+containers), `.github/workflows/deploy.yml` (WIF auth, push to Artifact Registry, two no-traffic
+revisions, smoke test, traffic split, monitor + scheduler), `infrastructure/setup_gcp.sh` (one-time
+idempotent bootstrap, creates no keys), and `tests/workflows/` (42 tests parsing the YAML and
+asserting the invariants). `src/monitoring/scheduler.py` gained a CLI so CI provisions the schedule
+through tested code. 551 tests pass; ruff is clean.
 
-**Verified live, not just unit-tested.** `POST /drift-check` was driven with an empty body (as
-Scheduler sends) and returned `drifted=false, worst_psi=0.0113`. A simulated fraud ring (foreign,
-card-not-present, 20× baseline, 03:00) produced `DRIFT: 6/13 features, is_foreign psi=15.40`,
-explanation drift 0.2165 vs a 0.0111 baseline, retraining correctly skipped under `--dry-run`.
+**Verified before shipping:** `Dockerfile.monitoring` was built (2.67 GB, correctly carries the gcp
+extra) and its container serves `/health` and `POST /drift-check`. Every `run:` block in both
+workflows was extracted and passed through `bash -n`. The `jq -er` tagged-URL extraction was tested
+against a realistic Cloud Run `describe` payload and confirmed to exit non-zero on a missing tag. The
+CI smoke-test greps (`"status":"ok"`, `"is_flagged":true`) were verified against real server output.
 
-Artefacts now written by training: `model_*.joblib`, `explainer_*.joblib`, `metrics.json`,
-`reference_profile.json`, `reference_importance.json`. Both Dockerfiles copy `artifacts/` at build
-time, so **`docker build` requires a prior training run**.
+**Two footguns fixed before they could fail a real deploy:**
+1. `gcloud auth print-identity-token` does **not** work under Workload Identity Federation — a
+   federated credential cannot mint an ID token. The smoke test now impersonates the deployer SA
+   with `--audiences=<exact URL>`, and `setup_gcp.sh` grants it `serviceAccountTokenCreator` on
+   itself. Without that binding the smoke test 403s and nothing ever deploys.
+2. The original `--format="...extract(url)"` projection for the tagged revision URL was fragile;
+   replaced with `jq -er`.
 
-Dependency layout: `uv sync` = inference only (what `Dockerfile` installs);
-`uv sync --extra gcp --extra dev` = everything. **The test suite requires the `gcp` extra**
-(`tests/features/test_bigquery.py` constructs real `SchemaField`s), and `Dockerfile.monitoring`
-installs `--extra gcp`. Phase 7's CI workflow must use `--extra gcp --extra dev`.
+**README corrected, not just extended.** It previously claimed per-prediction attributions were
+"mirrored into BigQuery". They are not — the writer exists but `app.py` never calls it. The claim
+is now accurate and a **Known limitations** section was added.
 
-**Nothing has been merged to `main` yet.** Deliberate: merging to `main` is what should trigger the
-CI/CD deploy, so promoting a `main` with no workflow behind it would make the first production merge
-manual and unreproducible. Phase 7 adds the workflow, then `develop` → `main` and tag `v1.0.0`.
+**NEXT ACTION: merge `develop` → `main` and tag `v1.0.0`.** This is the first production milestone
+and the workflow now exists to make the deploy reproducible. Note the deploy job will *attempt* to
+run on that merge; it will fail at the `auth` step unless the repo secrets/variables from
+`setup_gcp.sh` are configured. That is expected and harmless (nothing is deployed), but if the user
+wants a clean first run they should either configure the secrets first or let the workflow fail.
 
-**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–6 is unit-tested
-against fakes only. `submit_training_job`, `create_feature_store`, `ensure_dataset`,
-`ensure_prediction_log`, `log_training_run`, `log_global_importance`,
-`log_predictions_to_bigquery`, `ensure_drift_check_job` have never run against the live API.
-In particular `aiplatform.start_run(resume=True)` assumes the run already exists from
-`src/training/experiments.py`; that ordering is untested against the real SDK.
+Required GitHub config (from `setup_gcp.sh` output):
+- Secrets: `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`, `SCHEDULER_SERVICE_ACCOUNT`
+- Variables: `GCP_PROJECT_ID`, `GCP_REGION`, `ARTIFACT_REPOSITORY`, `GCP_BUCKET_NAME`,
+  `BIGQUERY_DATASET`, `FEATURE_STORE_ID`
+- An `environment: production` must exist (deploy.yml targets it).
 
-**Known gaps, carried forward:**
-- The inference service still does **not write to `prediction_log`**. Schema and writer both exist
-  but `app.py` never calls it — needs a BigQuery client on the serving path and a background write
-  so the request is not blocked. This also means the Phase 8 A/B dashboard currently has **no
-  production prediction data to read**; it will have to fall back to `metrics.json`.
-- `InMemoryStateStore` reads the committed CSV. The real `Featurestore` reader satisfying
-  `lookup(customer_id, as_of)` is not written.
-- `MAX_RECENT_EVENTS = 100` caps the online event log; `CustomerState.truncated` records when the
-  cap bit, but nothing alerts on it.
-- The drift monitor compares the *whole* current batch against the reference. There is no
-  windowing/cadence logic (e.g. "last 24h only") beyond the `--start-date`/`--end-date` bounds.
+**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–7 is unit-tested
+against fakes only. `aiplatform.start_run(resume=True)` in `src/evaluation/experiments.py` assumes
+the run already exists from `src/training/experiments.py`; untested against the real SDK.
 
-Phase 7 starts with:
-`git checkout develop && git pull && git checkout -b feature/cicd`
-It will build `.github/workflows/`: a PR check (ruff + pytest + docker build) and a deploy workflow
-on merge to `main` (build/push both images to Artifact Registry, deploy both Cloud Run services,
-smoke-test `/health`, shift traffic per the A/B split, provision the Scheduler job) using Workload
-Identity Federation — no service-account JSON key anywhere.
+**Known gaps, carried forward (also listed in README > Known limitations):**
+- The inference service still does **not write to `prediction_log`**. So the Phase 8 A/B dashboard
+  has **no production prediction data** and must read `artifacts/metrics.json`. The clean fix is
+  structured logging to Cloud Logging + a BigQuery sink (no SDK on the serving path, no latency).
+- `InMemoryStateStore` reads the committed CSV; the real Featurestore reader is unwritten.
+- `MAX_RECENT_EVENTS = 100` caps the online event log; `truncated` is recorded but nothing alerts.
+- Drift monitor compares the whole current batch; no windowing beyond `--start-date`/`--end-date`.
+
+Phase 8 (after the main merge) starts with:
+`git checkout develop && git pull && git checkout -b feature/ab-dashboard`
+A/B test dashboard reading `metrics.json` (and `prediction_log` when it exists): AUC, PR-AUC, F1,
+business cost per 1k with its bootstrap CI, latency, and the SHAP importance profile per variant.

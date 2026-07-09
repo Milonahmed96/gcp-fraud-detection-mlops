@@ -131,3 +131,44 @@ def delete_drift_check_job(spec: SchedulerJobSpec, client=None) -> bool:
         logger.info("Cloud Scheduler job %s did not exist", spec.job_name)
         return False
     return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Provision the drift-check job. Called from the deploy workflow.
+
+    CI invokes this rather than a hand-rolled `gcloud scheduler jobs create ||
+    update` shell incantation, so the idempotency the tests cover is the
+    idempotency that actually runs in production.
+    """
+    import argparse
+    import sys
+
+    from src.features.config import load_config
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    parser = argparse.ArgumentParser(description="Provision the drift-check Cloud Scheduler job.")
+    parser.add_argument("--target-uri", required=True, help="https URL of the drift-check endpoint")
+    parser.add_argument(
+        "--service-account", required=True, help="Service account for the OIDC token"
+    )
+    parser.add_argument("--schedule", default=DEFAULT_SCHEDULE)
+    parser.add_argument("--timezone", default=DEFAULT_TIMEZONE)
+    parser.add_argument("--job-name", default=DEFAULT_JOB_NAME)
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+
+    spec = SchedulerJobSpec(
+        config=load_config(),
+        target_uri=args.target_uri,
+        service_account_email=args.service_account,
+        schedule=args.schedule,
+        timezone=args.timezone,
+        job_name=args.job_name,
+    )
+    ensure_drift_check_job(spec)
+    logger.info("drift-check job %s targets %s", spec.job_name, spec.target_uri)
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
