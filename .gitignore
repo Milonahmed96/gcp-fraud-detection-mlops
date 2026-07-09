@@ -15,6 +15,9 @@ build/
 # ML tracking
 mlruns/
 
+# Trained model artefacts and metrics — regenerate with src.training.train
+artifacts/
+
 # Data
 data/raw/
 
