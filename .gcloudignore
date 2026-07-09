@@ -1,0 +1,27 @@
+# What Cloud Build uploads as the build context.
+#
+# Without this file gcloud derives the ignore list from .gitignore, which
+# excludes artifacts/ -- and both Dockerfiles COPY artifacts/. The build would
+# fail on a missing directory that exists perfectly well on disk.
+#
+# So: artifacts/ and data/sample/ are deliberately INCLUDED here, and .env is
+# deliberately excluded. Never upload credentials to a build context.
+
+.git/
+.github/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+tests/
+notebooks/
+
+# Credentials — never.
+.env
+*.json.key
+service-account*.json
+
+# Local-only
+*.md
+!README.md
