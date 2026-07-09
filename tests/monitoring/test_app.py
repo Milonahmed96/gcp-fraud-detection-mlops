@@ -43,8 +43,14 @@ class TestDashboard:
         assert response.headers["content-type"].startswith("text/html")
         assert response.text.startswith("<!doctype html>")
 
-    def test_renders_the_verdict(self, client):
-        assert "No significant difference" in client.get("/dashboard").text
+    def test_renders_the_verdict(self, client, artifacts_dir):
+        """Assert the page agrees with the report, not a hardcoded string. With a
+        small bootstrap the significance verdict is data- and platform-dependent,
+        and a literal here failed on CI while passing locally."""
+        from src.evaluation.report import load_report
+
+        report = load_report(artifacts_dir)
+        assert report.verdict in client.get("/dashboard").text
 
     def test_is_self_contained(self, client):
         """No CDN, no script: it must render inside a locked-down service."""
