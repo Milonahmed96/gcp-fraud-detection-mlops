@@ -7,10 +7,20 @@ requires-python = ">=3.11"
 authors = [{ name = "Milon Ahmed" }]
 
 # Dependencies are added phase by phase as each module lands.
-dependencies = []
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "python-dotenv>=1.0",
+    "google-cloud-bigquery>=3.25",
+    "google-cloud-aiplatform>=1.60",
+    "pyarrow>=16.0",
+]
 
 [project.optional-dependencies]
-dev = []
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
 
 [build-system]
 requires = ["hatchling"]
