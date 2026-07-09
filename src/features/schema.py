@@ -33,6 +33,15 @@ EVENT_TIMESTAMP_COLUMN = "timestamp"
 TRANSACTION_ID_COLUMN = "transaction_id"
 LABEL_COLUMN = "is_fraud"
 
+#: The transaction amount is **not a model feature** -- `amount_log` is. But the
+#: business cost metric prices a missed fraud at the amount that was stolen, so
+#: the amount must travel with the training set. Omitting it from the feature
+#: table silently zeroes every false-negative cost, the cost-minimising
+#: threshold then blocks nobody, and the A/B test compares two models on a
+#: metric that is identically zero. That is exactly what happened on the first
+#: real Vertex AI run.
+COST_BASIS_COLUMN = "amount"
+
 RAW_TRANSACTIONS_TABLE = "raw_transactions"
 FEATURES_TABLE = "transaction_features"
 PREDICTIONS_TABLE = "prediction_log"

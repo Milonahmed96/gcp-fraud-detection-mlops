@@ -16,6 +16,7 @@ import pandas as pd
 
 from src.features.config import GCPConfig
 from src.features.schema import (
+    COST_BASIS_COLUMN,
     EVENT_TIMESTAMP_COLUMN,
     FEATURE_SPECS,
     FEATURES_TABLE,
@@ -53,13 +54,21 @@ def to_bigquery_schema(specs: tuple[FieldSpec, ...]) -> list[bigquery.SchemaFiel
     ]
 
 
+#: Columns carried alongside the features: the keys, the label, and the cost
+#: basis. `amount` is not a model input -- it is what a missed fraud costs.
+FEATURE_TABLE_KEY_COLUMNS = (
+    "transaction_id",
+    "customer_id",
+    EVENT_TIMESTAMP_COLUMN,
+    LABEL_COLUMN,
+    COST_BASIS_COLUMN,
+)
+
+
 def features_table_schema() -> list[bigquery.SchemaField]:
-    """Schema of the engineered feature table: keys + label + every feature."""
-    keys = tuple(
-        spec
-        for spec in RAW_TRANSACTION_SCHEMA
-        if spec.name in {"transaction_id", "customer_id", EVENT_TIMESTAMP_COLUMN, LABEL_COLUMN}
-    )
+    """Schema of the engineered feature table: keys + label + cost basis + features."""
+    by_name = {spec.name: spec for spec in RAW_TRANSACTION_SCHEMA}
+    keys = tuple(by_name[name] for name in FEATURE_TABLE_KEY_COLUMNS)
     return to_bigquery_schema(keys + FEATURE_SPECS)
 
 
@@ -199,13 +208,7 @@ def ingest_features(client: Any, config: GCPConfig, df: pd.DataFrame) -> int:
     Only the key columns, the label, and the declared features are written --
     the raw columns they were derived from stay in `raw_transactions`.
     """
-    columns = [
-        "transaction_id",
-        "customer_id",
-        EVENT_TIMESTAMP_COLUMN,
-        LABEL_COLUMN,
-        *feature_names(),
-    ]
+    columns = [*FEATURE_TABLE_KEY_COLUMNS, *feature_names()]
     missing = [col for col in columns if col not in df.columns]
     if missing:
         raise ValueError(f"feature frame is missing columns: {', '.join(missing)}")
@@ -230,6 +233,7 @@ SELECT
     transaction_id,
     customer_id,
     {EVENT_TIMESTAMP_COLUMN},
+    {COST_BASIS_COLUMN},
     {feature_columns},
     {LABEL_COLUMN}
 FROM `{config.table_ref(FEATURES_TABLE)}`

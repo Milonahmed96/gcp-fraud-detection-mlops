@@ -275,7 +275,15 @@ class TestIngestion:
         bq.ingest_raw_transactions(client, config, raw_transactions)
         assert client.last_load_job.result_called is True
 
-    def test_ingest_features_writes_only_keys_label_and_features(self, config, raw_transactions):
+    def test_ingest_features_writes_keys_label_cost_basis_and_features(
+        self, config, raw_transactions
+    ):
+        """`amount` must travel with the features.
+
+        It is not a model input -- `amount_log` is -- but the business cost
+        metric prices a missed fraud at the amount stolen. Omitting it zeroes
+        every false-negative cost, and the first live Vertex run did exactly
+        that: cost/1k = 0.00, zero customers blocked, every fraud missed."""
         client = FakeClient()
         features = build_feature_frame(raw_transactions)
         rows = bq.ingest_features(client, config, features)
@@ -284,8 +292,25 @@ class TestIngestion:
         df, table_ref, _ = client.loaded[0]
         assert table_ref == f"test-project.fraud_features.{FEATURES_TABLE}"
 
-        expected = {"transaction_id", "customer_id", "timestamp", "is_fraud", *feature_names()}
+        expected = {
+            "transaction_id",
+            "customer_id",
+            "timestamp",
+            "is_fraud",
+            "amount",
+            *feature_names(),
+        }
         assert set(df.columns) == expected
+
+    def test_the_raw_inputs_are_not_duplicated_into_the_feature_table(
+        self, config, raw_transactions
+    ):
+        """Only the cost basis crosses over; merchant/country stay in raw_transactions."""
+        client = FakeClient()
+        bq.ingest_features(client, config, build_feature_frame(raw_transactions))
+        df, _, _ = client.loaded[0]
+        assert "merchant_id" not in df.columns
+        assert "country" not in df.columns
 
     def test_ingest_features_column_order_matches_the_table_schema(self, config, raw_transactions):
         client = FakeClient()
