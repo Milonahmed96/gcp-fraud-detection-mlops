@@ -152,6 +152,31 @@ class TestTemporalSplit:
         with pytest.raises(DatasetError, match="no fraud; cannot weight"):
             _ = d.scale_pos_weight
 
+    def test_a_frame_without_amount_is_rejected_loudly(self, features):
+        """The bug the first live Vertex run exposed.
+
+        `amount` used to fall back to zeros. Every missed fraud then cost £0, the
+        cost-minimising threshold blocked nobody, and the A/B test compared two
+        models on a metric that was identically zero. The AUCs looked fine and
+        nothing raised."""
+        with pytest.raises(DatasetError, match="business cost metric"):
+            temporal_split(features.drop(columns=["amount"]))
+
+    def test_amounts_are_the_real_transaction_values(self, features):
+        """Not zeros, not a placeholder."""
+        d = temporal_split(features)
+        assert d.train.amounts.sum() > 0
+        assert (d.test.amounts > 0).all()
+
+    def test_the_bigquery_training_set_carries_the_cost_basis(self):
+        """The query must select `amount`, or the whole cost model silently dies."""
+        from src.features.bigquery import training_set_query
+        from src.features.config import GCPConfig
+        from src.features.schema import COST_BASIS_COLUMN
+
+        sql = training_set_query(GCPConfig("p", "europe-west2", "b", "d", "f"))
+        assert f"\n    {COST_BASIS_COLUMN},\n" in sql
+
     def test_split_is_deterministic(self, features):
         a, b = temporal_split(features), temporal_split(features)
         np.testing.assert_array_equal(a.test.y, b.test.y)

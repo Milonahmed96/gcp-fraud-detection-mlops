@@ -25,7 +25,12 @@ import pandas as pd
 from src.features.bigquery import fetch_training_set
 from src.features.config import GCPConfig
 from src.features.sample_data import SAMPLE_PATH, load_sample
-from src.features.schema import EVENT_TIMESTAMP_COLUMN, LABEL_COLUMN, feature_names
+from src.features.schema import (
+    COST_BASIS_COLUMN,
+    EVENT_TIMESTAMP_COLUMN,
+    LABEL_COLUMN,
+    feature_names,
+)
 from src.features.transforms import build_feature_frame
 
 DataSource = Literal["sample", "bigquery"]
@@ -131,12 +136,29 @@ def load_features(
 
 
 def _slice(frame: pd.DataFrame) -> Split:
+    """Build one split.
+
+    `amount` is required, not optional. It used to fall back to `np.zeros(...)`,
+    which meant a frame missing the column priced every missed fraud at zero.
+    The cost-minimising threshold then correctly concluded that blocking nobody
+    is optimal, and the A/B test compared two models on a metric that was
+    identically zero. Nothing raised; the AUCs looked fine.
+
+    That is precisely what the first live Vertex AI run produced, because the
+    BigQuery training-set query did not select `amount`. A loud failure here
+    would have caught it in Phase 3.
+    """
+    if COST_BASIS_COLUMN not in frame.columns:
+        raise DatasetError(
+            f"training frame has no {COST_BASIS_COLUMN!r} column. It is the basis of the "
+            "business cost metric -- without it every false-negative costs zero and the "
+            "model learns to block nobody."
+        )
+
     return Split(
         X=frame[list(feature_names())].reset_index(drop=True),
         y=frame[LABEL_COLUMN].to_numpy().astype(int),
-        amounts=frame["amount"].to_numpy().astype(float)
-        if "amount" in frame.columns
-        else np.zeros(len(frame)),
+        amounts=frame[COST_BASIS_COLUMN].to_numpy().astype(float),
         timestamps=frame[EVENT_TIMESTAMP_COLUMN].reset_index(drop=True),
     )
 

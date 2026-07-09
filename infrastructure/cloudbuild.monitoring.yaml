@@ -1,0 +1,27 @@
+# Build the monitoring/training image natively on x86 with Cloud Build.
+#
+# Vertex AI and Cloud Run both run linux/amd64. Cross-building that from an ARM
+# Mac under QEMU takes the better part of an hour; Cloud Build does it natively
+# in minutes, and the free tier covers it.
+#
+#   gcloud builds submit --config=infrastructure/cloudbuild.monitoring.yaml \
+#     --substitutions=_IMAGE=europe-west2-docker.pkg.dev/PROJECT/fraud-detection/fraud-drift-monitor:latest
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --file=Dockerfile.monitoring
+      - --tag=${_IMAGE}
+      - .
+
+images:
+  - ${_IMAGE}
+
+options:
+  machineType: E2_HIGHCPU_8
+  logging: CLOUD_LOGGING_ONLY
+
+# The image is ~2.7 GB and pip-installs shap/numba. Default is 10 minutes.
+timeout: 3600s
