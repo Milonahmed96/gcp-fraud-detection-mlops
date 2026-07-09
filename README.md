@@ -307,6 +307,19 @@ Metrics compared:
 
 - **p50 / p95 / p99 latency** — a model that wins on cost but blows the latency budget doesn't ship
 
+### Result from a real Vertex AI training job
+
+Trained on `n1-standard-4`, reading the feature table from BigQuery, artefacts written to GCS via the `/gcs` FUSE mount:
+
+| Variant | ROC-AUC | PR-AUC | F1 | Cost / 1k txns | FP | FN |
+|---|---|---|---|---|---|---|
+| XGBoost | 0.760 | 0.430 | 0.487 | **843.65** | 6 | 13 |
+| LightGBM | 0.729 | 0.401 | 0.452 | 1017.40 | 2 | 15 |
+
+Delta `−173.75` per 1,000, 95% bootstrap interval `[−460.00, +25.10]` — **straddles zero, so not significant.** XGBoost is cheaper, but the pipeline reports the comparison as inconclusive and keeps the incumbent rather than shipping a coin flip.
+
+Note LightGBM blocks only **2** customers to XGBoost's **6**, yet costs more — because it misses **15** frauds to XGBoost's **13**. Fewer false positives, more money lost. A symmetric metric hides exactly that.
+
 ### Current result (local run, synthetic sample)
 
 Reproduce with `uv run python -m src.training.train --backend local`:
@@ -510,8 +523,15 @@ Authentication is **Workload Identity Federation**: GitHub Actions presents its 
 
 Two footguns worth naming, both caught before they could fail a real deploy:
 
-- **A federated credential cannot mint an ID token.** `gcloud auth print-identity-token` on its own fails under WIF, so the smoke test against the private Cloud Run service would 403 on every deploy. It impersonates the deployer service account (which holds `serviceAccountTokenCreator` on itself) and passes `--audiences` set to the exact URL being called.
-- **Cloud Scheduler's OIDC audience must be the bare service URL**, not the URL with `/drift-check` appended, or Cloud Run rejects the token.
+- **A federated credential cannot mint an ID token, and neither can impersonation.** `gcloud auth print-identity-token` fails under WIF; `--impersonate-service-account` fails too. The smoke test uses `google-github-actions/auth` with `token_format: id_token`, which asks Google's STS directly.
+- **The ID token's audience must be the *base* service URL**, not the tagged revision URL — even though the tagged URL is the thing being called. Proven by probe on a live deploy:
+  ```
+  probing https://xgb---fraud-inference-api-….a.run.app/health
+    audience=tagged -> HTTP 401  "the access token could not be verified"
+    audience=base   -> HTTP 200
+  ```
+- **`--no-traffic` is rejected when *creating* a Cloud Run service.** The flag applies only from the second deploy onward; a service with no revisions has no live traffic to protect.
+- **Cloud Scheduler's OIDC audience must also be the bare service URL**, not the URL with `/drift-check` appended.
 
 `tests/workflows/test_workflows.py` parses both YAML files and asserts these invariants — no `credentials_json`, `id-token: write` present, deploy `needs: verify`, smoke-test index before `update-traffic`, every action pinned rather than floating on `@main`. A broken workflow should fail the test suite, not the deploy.
 
@@ -539,7 +559,7 @@ Two footguns worth naming, both caught before they could fail a real deploy:
 
 Stated plainly, because a portfolio project that hides its gaps teaches the reader nothing.
 
-- **No GCP resource has ever been provisioned.** Every cloud call — Vertex AI training submission, Feature Store creation, BigQuery table provisioning, Cloud Scheduler jobs — is unit-tested against a fake client. None has run against a live project. The code is written to the documented APIs and the deploy workflow is syntax-checked, but expect small signature corrections on the first real run. `infrastructure/setup_gcp.sh` is the entry point.
+- **The Vertex AI Feature Store has never been provisioned.** It is the one component that bills continuously (~$0.90/node-hour) for a capability the serving path does not use. Everything else in this repo has now run against a live GCP project — see *What the first live run found* below.
 - **The serving path does not write to `prediction_log`.** The table schema and the writer both exist and are tested; `app.py` never calls them. Doing so needs a BigQuery client on the serving path and a background write so latency is unaffected — and the inference image deliberately excludes the BigQuery SDK, so the cleaner route is structured logging to Cloud Logging with a BigQuery sink.
 - **The A/B result on the sample is not statistically significant.** XGBoost costs less per 1,000 transactions than LightGBM, but the bootstrap interval straddles zero. The pipeline reports this honestly and keeps the incumbent rather than shipping a coin flip.
 - **`InMemoryStateStore` reads the committed CSV.** The real Vertex AI Feature Store reader satisfying `lookup(customer_id, as_of)` is not written. The interface exists so the swap is local.
@@ -562,6 +582,35 @@ Full detail in [CLAUDE.md](CLAUDE.md).
 
 ---
 
+## What the first live run found
+
+The project reached "604 tests passing, CI green, `v1.0.0` tagged" **before a single GCP resource had ever been created.** Every cloud call was tested against a fake client. Then it was provisioned for real, and the first live run found **nine defects that no test caught.**
+
+| # | Defect | Why no test found it |
+|---|---|---|
+| 1 | BigQuery `TIMESTAMP` is microsecond-resolution; nanoseconds crash pyarrow | The fake client never serialised anything |
+| 2 | `db-dtypes` is required by `to_dataframe()` and was never declared | Never called against a real result set |
+| 3 | `CustomTrainingJob(script_path=…)` packages **one file**; `train.py` imports the whole `src` package | The fake never packaged anything |
+| 4 | `python-dotenv` discovery walks up from the *calling module*, finding the repo's `.env` and defeating config-test isolation | CI has no `.env` |
+| 5 | Cross-building a 2.7 GB image under QEMU takes over an hour | Only a wall-clock problem |
+| 6 | **The training set never selected `amount`, so every missed fraud cost £0** | `_slice` silently fell back to `np.zeros(...)` |
+| 7 | `--no-traffic` is rejected when *creating* a Cloud Run service | No test can know what an API will refuse |
+| 8 | `gcloud auth print-identity-token --impersonate-service-account` fails under WIF | Same |
+| 9 | The ID token's audience must be the **base** service URL, not the tagged revision URL | Same |
+
+**Number 6 is the one that matters.** The cost-minimising threshold correctly concluded that blocking nobody is optimal when every false negative costs zero. ROC-AUC still read `0.7597`. The A/B dashboard would have reported a clean tie. A fraud model that never blocks fraud would have shipped, and every offline metric would have looked healthy:
+
+```
+before:  xgboost  roc_auc=0.7597  f1=0.1667  cost/1k=0.00     (fp=0  fn=20)
+after:   xgboost  roc_auc=0.7597  f1=0.4865  cost/1k=843.65   (fp=6  fn=13)
+```
+
+`_slice` now raises instead of substituting zeros. Two tests — one asserting `amount` be *excluded* from the feature table, one asserting the impersonation mechanism — turned out to be **encoding the bug rather than catching it.**
+
+Three of the nine live in the same thirty lines of deploy workflow. That region is unreachable by any test, because no assertion can tell you what the Cloud Run API will reject.
+
+---
+
 ## What this project is trying to demonstrate
 
 Not that a gradient-boosted tree can detect fraud — that is a solved exercise. Rather:
@@ -571,6 +620,7 @@ Not that a gradient-boosted tree can detect fraud — that is a solved exercise.
 - **Explanations that can be audited.** SHAP attributions in log-odds space, with an additivity check, and normalisation across the three shapes `TreeExplainer` returns — because taking the wrong class axis inverts every explanation and nothing raises.
 - **A deploy whose rollback is its ordering.** New revisions take no traffic until they pass a smoke test on their own URL. There is no rollback step because traffic never moves.
 - **Honesty about what is not done.** Every gap is written down in *Known limitations* and drawn as a dashed edge in the architecture diagram.
+- **That a green test suite is not the same as working software.** Nine defects survived 604 tests and a green CI, and died within an hour of contact with real GCP. The fixes, and the tests that now encode what the live run *proved* rather than what seemed obvious, are the point.
 
 ---
 
