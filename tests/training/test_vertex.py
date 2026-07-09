@@ -36,7 +36,7 @@ class FakeAIPlatform:
     def init(self, **kwargs):
         self.init_kwargs = kwargs
 
-    def CustomTrainingJob(self, **kwargs):  # noqa: N802 -- mirrors the SDK's name
+    def CustomJob(self, **kwargs):  # noqa: N802 -- mirrors the SDK's name
         self.job = FakeJob(**kwargs)
         return self.job
 
@@ -110,6 +110,17 @@ class TestBuildJobArgs:
 
 
 class TestSubmitTrainingJob:
+    """Submission runs our own container image, not a packaged script.
+
+    `CustomTrainingJob(script_path=...)` ships a single file plus a generated
+    setup.py. `train.py` imports src.features / src.evaluation / src.monitoring,
+    none of which would exist remotely -- and it needs setuptools locally, which
+    uv does not install. Both failures appeared on the first real submission.
+    """
+
+    def _spec(self, fake_sdk) -> dict:
+        return fake_sdk.job.init_kwargs["worker_pool_specs"][0]
+
     def test_initialises_the_sdk_from_config(self, config, fake_sdk):
         vertex.submit_training_job(config)
         assert fake_sdk.init_kwargs == {
@@ -118,28 +129,92 @@ class TestSubmitTrainingJob:
             "staging_bucket": "gs://test-bucket",
         }
 
-    def test_packages_the_training_script(self, config, fake_sdk):
+    def test_runs_our_own_artifact_registry_image(self, config, fake_sdk):
         vertex.submit_training_job(config)
-        assert fake_sdk.job.init_kwargs["script_path"] == "src/training/train.py"
+        image = self._spec(fake_sdk)["container_spec"]["image_uri"]
+        assert image == (
+            "europe-west2-docker.pkg.dev/test-project/fraud-detection/fraud-drift-monitor:latest"
+        )
 
-    def test_installs_the_model_libraries_in_the_container(self, config, fake_sdk):
+    def test_never_packages_a_bare_script(self, config, fake_sdk):
+        """The regression this rewrite exists to prevent."""
         vertex.submit_training_job(config)
-        requirements = " ".join(fake_sdk.job.init_kwargs["requirements"])
-        assert "xgboost" in requirements and "lightgbm" in requirements
+        assert "script_path" not in fake_sdk.job.init_kwargs
+        assert "requirements" not in fake_sdk.job.init_kwargs
+
+    def test_invokes_the_training_module_not_a_file(self, config, fake_sdk):
+        vertex.submit_training_job(config)
+        assert self._spec(fake_sdk)["container_spec"]["command"] == [
+            "python",
+            "-m",
+            "src.training.train",
+        ]
 
     def test_runs_on_the_documented_machine_type(self, config, fake_sdk):
         """The README's cost estimate assumes this machine."""
         vertex.submit_training_job(config)
-        assert fake_sdk.job.run_kwargs["machine_type"] == "n1-standard-4"
-        assert fake_sdk.job.run_kwargs["replica_count"] == 1
-
-    def test_forwards_local_backend_args_to_the_remote_run(self, config, fake_sdk):
-        vertex.submit_training_job(config, source="bigquery", args=["--backend", "vertex"])
-        assert fake_sdk.job.run_kwargs["args"][:2] == ["--backend", "local"]
-
-    def test_returns_the_sdk_handle(self, config, fake_sdk):
-        assert vertex.submit_training_job(config) == "model-artifact"
+        spec = self._spec(fake_sdk)
+        assert spec["machine_spec"]["machine_type"] == "n1-standard-4"
+        assert spec["replica_count"] == 1
 
     def test_machine_type_is_overridable(self, config, fake_sdk):
         vertex.submit_training_job(config, machine_type="n1-highmem-8")
-        assert fake_sdk.job.run_kwargs["machine_type"] == "n1-highmem-8"
+        assert self._spec(fake_sdk)["machine_spec"]["machine_type"] == "n1-highmem-8"
+
+    def test_forwards_local_backend_args_to_the_remote_run(self, config, fake_sdk):
+        vertex.submit_training_job(config, source="bigquery", args=["--backend", "vertex"])
+        assert self._spec(fake_sdk)["container_spec"]["args"][:2] == ["--backend", "local"]
+
+    def test_artefacts_are_written_to_the_gcs_fuse_mount(self, config, fake_sdk):
+        """A container filesystem is ephemeral; /gcs survives the job."""
+        vertex.submit_training_job(config)
+        args = self._spec(fake_sdk)["container_spec"]["args"]
+        assert "--output-dir" in args
+        assert "/gcs/test-bucket/artifacts" in args
+
+    def test_a_caller_supplied_output_dir_is_overridden(self, config, fake_sdk):
+        """A local path would silently discard every artefact."""
+        vertex.submit_training_job(config, args=["--output-dir", "artifacts"])
+        args = self._spec(fake_sdk)["container_spec"]["args"]
+        assert args.count("--output-dir") == 1
+        assert "artifacts" not in args or "/gcs/" in " ".join(args)
+        assert "/gcs/test-bucket/artifacts" in args
+
+    def test_gcp_config_is_passed_as_environment(self, config, fake_sdk):
+        """The container has no .env file; config must arrive as env vars."""
+        vertex.submit_training_job(config)
+        env = {e["name"]: e["value"] for e in self._spec(fake_sdk)["container_spec"]["env"]}
+        assert env["GCP_PROJECT_ID"] == "test-project"
+        assert env["GCP_REGION"] == "europe-west2"
+        assert env["BIGQUERY_DATASET"] == "fraud_features"
+
+    def test_returns_the_job_handle(self, config, fake_sdk):
+        assert vertex.submit_training_job(config) is fake_sdk.job
+
+
+class TestImageUri:
+    def test_points_at_artifact_registry_in_the_configured_region(self, config):
+        assert vertex.default_image_uri(config).startswith("europe-west2-docker.pkg.dev/")
+
+    def test_tag_is_overridable(self, config):
+        assert vertex.default_image_uri(config, tag="abc123").endswith(":abc123")
+
+
+class TestStripOutputDirFlag:
+    def test_removes_space_separated_flag(self):
+        assert vertex.strip_output_dir_flag(
+            ["--output-dir", "artifacts", "--source", "sample"]
+        ) == [
+            "--source",
+            "sample",
+        ]
+
+    def test_removes_equals_separated_flag(self):
+        assert vertex.strip_output_dir_flag(["--output-dir=artifacts", "--source", "sample"]) == [
+            "--source",
+            "sample",
+        ]
+
+    def test_leaves_other_arguments_alone(self):
+        args = ["--source", "sample"]
+        assert vertex.strip_output_dir_flag(args) == args

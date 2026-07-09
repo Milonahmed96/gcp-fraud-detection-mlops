@@ -107,6 +107,67 @@ class TestSchemaConversion:
         assert len(names) == len(set(names))
 
 
+class TestTimestampTruncation:
+    """BigQuery TIMESTAMP is microsecond-resolution.
+
+    pyarrow refuses to cast `timestamp[ns]` to `timestamp[us]` and raises
+    `ArrowInvalid: ... would lose data`. The fake client never serialised
+    anything, so this only surfaced on the first live ingestion.
+    """
+
+    def test_nanoseconds_are_floored_to_microseconds(self):
+        frame = pd.DataFrame(
+            {"timestamp": pd.to_datetime(["2024-01-01 00:13:20.491923226"]), "amount": [1.0]}
+        )
+        assert frame["timestamp"].iloc[0].nanosecond == 226
+
+        out = bq.truncate_timestamps(frame)
+        assert out["timestamp"].iloc[0].nanosecond == 0
+        assert out["timestamp"].iloc[0] == pd.Timestamp("2024-01-01 00:13:20.491923")
+
+    def test_the_callers_frame_is_not_mutated(self):
+        frame = pd.DataFrame({"timestamp": pd.to_datetime(["2024-01-01 00:00:00.123456789"])})
+        bq.truncate_timestamps(frame)
+        assert frame["timestamp"].iloc[0].nanosecond == 789
+
+    def test_non_datetime_columns_are_untouched(self):
+        frame = pd.DataFrame({"amount": [1.5], "name": ["x"]})
+        pd.testing.assert_frame_equal(bq.truncate_timestamps(frame), frame)
+
+    def test_a_frame_without_datetimes_is_returned_unchanged(self):
+        frame = pd.DataFrame({"a": [1, 2]})
+        assert bq.truncate_timestamps(frame) is frame  # no needless copy
+
+    def test_every_datetime_column_is_floored(self):
+        frame = pd.DataFrame(
+            {
+                "created": pd.to_datetime(["2024-01-01 00:00:00.111111111"]),
+                "updated": pd.to_datetime(["2024-01-01 00:00:00.222222222"]),
+            }
+        )
+        out = bq.truncate_timestamps(frame)
+        assert all(out[c].iloc[0].nanosecond == 0 for c in ("created", "updated"))
+
+    def test_ingestion_floors_timestamps_before_loading(self, config, raw_transactions):
+        """The load path must never hand pyarrow a nanosecond timestamp."""
+        client = FakeClient()
+        nanosecond = raw_transactions.copy()
+        nanosecond["timestamp"] = nanosecond["timestamp"] + pd.Timedelta("123ns")
+
+        bq.ingest_raw_transactions(client, config, nanosecond)
+
+        loaded, _, _ = client.loaded[0]
+        assert (loaded["timestamp"].dt.nanosecond == 0).all()
+
+    def test_the_sample_data_actually_has_nanoseconds(self):
+        """Guards the premise: if the sample lost its nanoseconds, this test file
+        would be asserting nothing."""
+        from src.features.sample_data import load_sample
+
+        sample = load_sample()
+        assert (sample["timestamp"].dt.nanosecond != 0).any()
+
+
 class TestPredictionLog:
     """The audit log table. Phase 4 wrote to it before it had a schema."""
 
@@ -214,7 +275,15 @@ class TestIngestion:
         bq.ingest_raw_transactions(client, config, raw_transactions)
         assert client.last_load_job.result_called is True
 
-    def test_ingest_features_writes_only_keys_label_and_features(self, config, raw_transactions):
+    def test_ingest_features_writes_keys_label_cost_basis_and_features(
+        self, config, raw_transactions
+    ):
+        """`amount` must travel with the features.
+
+        It is not a model input -- `amount_log` is -- but the business cost
+        metric prices a missed fraud at the amount stolen. Omitting it zeroes
+        every false-negative cost, and the first live Vertex run did exactly
+        that: cost/1k = 0.00, zero customers blocked, every fraud missed."""
         client = FakeClient()
         features = build_feature_frame(raw_transactions)
         rows = bq.ingest_features(client, config, features)
@@ -223,8 +292,25 @@ class TestIngestion:
         df, table_ref, _ = client.loaded[0]
         assert table_ref == f"test-project.fraud_features.{FEATURES_TABLE}"
 
-        expected = {"transaction_id", "customer_id", "timestamp", "is_fraud", *feature_names()}
+        expected = {
+            "transaction_id",
+            "customer_id",
+            "timestamp",
+            "is_fraud",
+            "amount",
+            *feature_names(),
+        }
         assert set(df.columns) == expected
+
+    def test_the_raw_inputs_are_not_duplicated_into_the_feature_table(
+        self, config, raw_transactions
+    ):
+        """Only the cost basis crosses over; merchant/country stay in raw_transactions."""
+        client = FakeClient()
+        bq.ingest_features(client, config, build_feature_frame(raw_transactions))
+        df, _, _ = client.loaded[0]
+        assert "merchant_id" not in df.columns
+        assert "country" not in df.columns
 
     def test_ingest_features_column_order_matches_the_table_schema(self, config, raw_transactions):
         client = FakeClient()
