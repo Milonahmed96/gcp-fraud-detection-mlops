@@ -1,9 +1,10 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: **ALL 9 PHASES COMPLETE.** v1.0.0 tagged on main. CI green on GitHub.
-Last completed: feature/final-polish (architecture diagram, verified cost breakdown, Feature Store deprecation notice)
-Next task: none required. Optional follow-ups listed under "Outstanding work" below.
+Phase: **DEPLOYED TO REAL GCP.** All 9 phases complete + live provisioning run.
+Last completed: live deploy via GitHub Actions/WIF — 2 Cloud Run services, 50/50 A/B split,
+  Cloud Scheduler enabled, 2 Vertex AI training jobs SUCCEEDED.
+Next task: provision Feature Store for the demo video, then tear down. See "Teardown" below.
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -99,69 +100,64 @@ Next task: none required. Optional follow-ups listed under "Outstanding work" be
 - Cloud Run region: europe-west2 (London) preferred
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
-## Final state
+## Live GCP state (project: fraud-mlops-london, europe-west2)
 
-**All nine phases complete.** `main` and `develop` are level; `v1.0.0` is tagged on `main`.
-604 tests pass; GitHub Actions is green (Lint, Test, Build images). The deploy job skips cleanly
-until GCP is configured.
+| Resource | Name | Notes |
+|---|---|---|
+| Cloud Run | `fraud-inference-api` | private; xgb 50% / lgbm 50% |
+| Cloud Run | `fraud-drift-monitor` | private; `/drift-check` + `/dashboard` |
+| Cloud Scheduler | `fraud-drift-check` | `0 2 * * *`, ENABLED, 900s deadline |
+| BigQuery | `fraud_features` | raw_transactions, transaction_features, prediction_log |
+| Artifact Registry | `fraud-detection` | both images, tagged by commit SHA |
+| GCS | `fraud-mlops-london-artifacts` | Vertex-written models/explainers/metrics |
+| Vertex AI | 2 CustomJobs | both `JOB_STATE_SUCCEEDED` |
+| Budget alert | £20, 50/90/100% | created before anything billable |
+| **Feature Store** | **not provisioned** | the only thing that bills while idle (~$0.90/node-hr) |
 
-### What exists
-- `src/features/` — env-driven config, the shared schema contract, causal feature engineering,
-  BigQuery offline store, Feature Store (legacy API), deterministic synthetic sample data.
-- `src/training/` — business cost metric + bootstrap CI, temporal split, two capacity-matched
-  variants, train CLI with `--backend local|vertex`, Vertex submission, Experiments logging.
-- `src/evaluation/` — SHAP explainer (version-stable class-axis handling, additivity check),
-  experiment/BigQuery logging, A/B report loader, self-contained HTML dashboard.
-- `src/inference/` — causal `CustomerState`, serving features with zero train/serve skew, Pydantic
-  contract, artefact registry (trained threshold), FastAPI app. `Dockerfile` → 2.16 GB.
-- `src/monitoring/` — PSI/KS drift, scheduled check + retraining trigger, idempotent Cloud Scheduler
-  job, drift-monitor Cloud Run service serving `/drift-check` and `/dashboard`.
-  `Dockerfile.monitoring` → 2.67 GB (carries the gcp extra).
-- `.github/workflows/` — PR gate (lint, tests, build **and run** both containers) and a deploy that
-  never shifts traffic to an unsmoke-tested revision. WIF, no keys.
-- `infrastructure/` — `setup_gcp.sh` (one-time bootstrap) and `architecture.drawio`.
+Verified live: fraud txn → `0.9958` FLAGGED (26ms, with SHAP); genuine → `0.0017`. Threshold
+`0.4333` (from the Vertex run, not 0.5). 8 `/health` calls → 7 xgboost, 1 lightgbm.
 
-### Verified behaviour (not just unit-tested)
-- Inference: fraud 0.9945 flagged, genuine 0.0011 not flagged, 6–13 ms including SHAP. Verified via
-  uvicorn and inside the Docker container.
-- Drift: quiet against its own training distribution (worst PSI 0.0113); a simulated fraud ring
-  produced `DRIFT: 6/13 features, is_foreign psi=15.40`.
-- Dashboard: rendered in a real browser; shared-scale bug and a table-wrap bug found that way.
-- Mermaid diagram: rendered with mermaid v11 (14 nodes, 20 edges, 5 subgraphs), no parse errors.
-- CI: green on GitHub for both `develop` and `main`.
+GitHub: WIF secrets + 6 variables + `production` environment configured. Zero service-account keys.
 
-### The A/B result
-XGBoost cost/1k = 984.69, LightGBM = 1017.40, delta `-32.71 [-143.96, +29.17]` — **not significant**.
-LightGBM wins F1 (0.452 vs 0.444) and loses on cost. The incumbent is kept. This is the intended,
-honest outcome, not a failure to find a winner.
+## The nine defects the live run found
 
-## Outstanding work (all documented in README > Known limitations)
+Documented in README > "What the first live run found". Summary:
+1. BigQuery TIMESTAMP is microsecond-resolution (nanoseconds crash pyarrow)
+2. `db-dtypes` undeclared, required by `to_dataframe()`
+3. `CustomTrainingJob(script_path=)` packages one file → rewritten as a container `CustomJob`
+4. dotenv discovery walks from the calling module → broke config test isolation once `.env` existed
+5. QEMU cross-build ~1hr → Cloud Build, 3 min
+6. **`amount` never selected → business cost identically zero → model blocks nobody** (AUC still 0.76)
+7. `--no-traffic` rejected when creating a Cloud Run service
+8. `print-identity-token --impersonate-service-account` fails under WIF
+9. **ID token audience must be the BASE service URL, not the tagged revision URL**
 
-1. **No GCP resource has ever been provisioned.** Every cloud call is tested against a fake client.
-   `submit_training_job`, `create_feature_store`, `ensure_dataset`, `ensure_prediction_log`,
-   `log_training_run`, `log_global_importance`, `log_predictions_to_bigquery`,
-   `ensure_drift_check_job` have never run live. Run `infrastructure/setup_gcp.sh`, set the repo
-   secrets/variables, and expect small signature corrections on the first real invocation.
-2. **`src/features/feature_store.py` uses Vertex AI Feature Store (Legacy).** Optimized online
-   serving sunsets **2027-02-17**; the migration path is Bigtable online serving, or Feature Store as
-   a metadata layer over BigQuery. Breaks nothing today because serving does not call it.
-3. **The serving path does not write to `prediction_log`.** Schema and writer exist. The clean fix is
-   structured logging to Cloud Logging + a BigQuery sink — no SDK on the serving path, no latency.
-   Until then the dashboard shows offline metrics only and no serving latency.
-4. **`InMemoryStateStore` reads the committed CSV.** The real Featurestore reader satisfying
-   `lookup(customer_id, as_of)` is unwritten.
-5. `MAX_RECENT_EVENTS = 100` caps the online event log; `CustomerState.truncated` records when the
-   cap bit, but nothing alerts on it.
-6. Drift monitor compares the whole batch; no windowing beyond `--start-date`/`--end-date`.
-7. `aiplatform.start_run(resume=True)` assumes the training run already exists — untested ordering.
+Two tests were found to be *encoding* bugs rather than catching them (the `amount` exclusion
+assertion, and the impersonation assertion).
 
-## Required GitHub configuration to enable deploys
-- Secrets: `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT`, `SCHEDULER_SERVICE_ACCOUNT`
-- Variables: `GCP_PROJECT_ID`, `GCP_REGION`, `ARTIFACT_REPOSITORY`, `GCP_BUCKET_NAME`,
-  `BIGQUERY_DATASET`, `FEATURE_STORE_ID`
-- An `environment: production` must exist. `deploy.yml` skips entirely while `GCP_PROJECT_ID` is unset.
+## Teardown (run when filming is done)
 
-## Reproducing everything locally
+```
+gcloud ai feature-stores delete "$FEATURE_STORE_ID" --region=europe-west2   # if provisioned
+gcloud run services delete fraud-inference-api  --region=europe-west2
+gcloud run services delete fraud-drift-monitor  --region=europe-west2
+gcloud scheduler jobs delete fraud-drift-check  --location=europe-west2
+```
+Cloud Run scales to zero and BigQuery/Scheduler are free-tier, so only the Feature Store
+genuinely needs deleting. The £20 budget alert stays as a backstop.
+
+## Outstanding work
+
+1. **Feature Store**: not provisioned; the module targets the deprecated *legacy* API
+   (sunset 2027-02-17, migration path is Bigtable). Serving does not use it.
+2. **The serving path does not write to `prediction_log`.** Table exists and is provisioned.
+   Clean fix: structured logging → Cloud Logging → BigQuery sink (no SDK on the serving path).
+3. `InMemoryStateStore` reads the committed CSV; the real Featurestore reader is unwritten.
+4. `MAX_RECENT_EVENTS = 100` caps the online event log; `truncated` recorded, nothing alerts.
+5. Drift monitor compares the whole batch; no windowing beyond `--start-date`/`--end-date`.
+6. `aiplatform.start_run(resume=True)` ordering still untested against the real SDK.
+
+## Reproducing locally
 ```
 uv sync --extra gcp --extra dev
 uv run pytest                                          # 604 tests
