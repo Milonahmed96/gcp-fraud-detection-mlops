@@ -248,7 +248,9 @@ class TestBuildxDriver:
     "Cache export is not supported for the docker driver". Caught by a real CI
     run, not by reading the docs."""
 
-    @pytest.mark.parametrize(("name", "job"), [("ci.yml", "build-images"), ("deploy.yml", "deploy")])
+    @pytest.mark.parametrize(
+        ("name", "job"), [("ci.yml", "build-images"), ("deploy.yml", "deploy")]
+    )
     def test_a_job_using_the_gha_cache_sets_up_buildx_first(self, name, job):
         steps = steps_of(load(name), job)
         uses = [step.get("uses", "") for step in steps]
