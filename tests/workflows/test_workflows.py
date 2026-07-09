@@ -200,14 +200,13 @@ class TestDeploySafety:
         assert last_smoke < shift
 
     def test_the_smoke_test_fails_the_job_on_error(self, deploy):
-        """It must exit non-zero when no audience yields a healthy response."""
         smoke = next(
             step
             for step in steps_of(deploy, "deploy")
             if step.get("name", "").startswith("Smoke-test")
         )
-        assert "smoke test FAILED" in smoke["run"]
-        assert "exit 1" in smoke["run"]
+        assert "set -euo pipefail" in smoke["run"]
+        assert "curl -sf" in smoke["run"]  # -f makes curl exit non-zero on 4xx/5xx
         assert '\'"status":"ok"\'' in smoke["run"]
 
     def test_no_diagnostic_step_ever_echoes_a_token(self, deploy):
@@ -237,16 +236,39 @@ class TestDeploySafety:
             for step in steps_of(deploy, "deploy")
             if step.get("with", {}).get("token_format") == "id_token"
         ]
-        assert len(minted) >= 2  # at least one audience per revision
+        assert len(minted) == 1  # one token, base audience, authenticates every revision
 
-    def test_each_id_token_audience_is_its_own_revision_url(self, deploy):
-        """Cloud Run rejects a token whose audience is not the URL being called."""
+    def test_the_id_token_audience_is_the_base_service_url(self, deploy):
+        """Proven on a live deploy: Cloud Run validates `aud` against the base
+        service URL, even when a *tagged* revision URL is the thing being called.
+
+            audience=tagged -> HTTP 401
+            audience=base   -> HTTP 200
+
+        A token minted for the tagged URL comes back "could not be verified"."""
+        minted = next(
+            step
+            for step in steps_of(deploy, "deploy")
+            if step.get("with", {}).get("token_format") == "id_token"
+        )
+        assert minted["with"]["id_token_audience"] == "${{ steps.urls.outputs.base }}"
+        assert minted["with"]["id_token_include_email"] is True
+
+    def test_the_urls_step_exports_the_base_url(self, deploy):
+        urls = next(step for step in steps_of(deploy, "deploy") if step.get("id") == "urls")
+        assert "base=" in urls["run"]
+
+    def test_no_diagnostic_steps_survive(self, deploy):
+        """The audience probe answered its question and was removed."""
+        names = [step.get("name", "") for step in steps_of(deploy, "deploy")]
+        assert not [n for n in names if "DIAGNOSTIC" in n]
+
+    def test_no_step_ever_echoes_a_token(self, deploy):
+        """Diagnostics are exactly where credentials leak into logs."""
         for step in steps_of(deploy, "deploy"):
-            with_block = step.get("with", {})
-            if with_block.get("token_format") == "id_token":
-                audience = with_block["id_token_audience"]
-                assert "steps.urls.outputs." in audience
-                assert with_block["id_token_include_email"] is True
+            run = step.get("run", "")
+            assert "print-identity-token" not in run
+            assert 'echo "$TOKEN"' not in run
 
     def test_both_variants_are_deployed_as_separate_revisions(self, deploy):
         script = run_script(deploy, "deploy")
