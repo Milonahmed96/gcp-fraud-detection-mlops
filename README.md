@@ -148,6 +148,16 @@ uv sync
 # Run the test suite (must pass before any merge)
 uv run pytest
 
+# Train both A/B variants locally against the committed sample — no GCP needed
+uv run python -m src.training.train --backend local
+
+# Or submit the same script as a Vertex AI Custom Training job (requires .env + gcloud auth)
+uv run python -m src.training.train --backend vertex --source bigquery \
+    --start-date 2024-01-01 --end-date 2024-03-01
+
+# Regenerate the synthetic sample data
+uv run python -m src.features.sample_data
+
 # Serve the inference API locally on :8080
 uv run uvicorn src.inference.main:app --reload --port 8080
 
@@ -210,6 +220,19 @@ Metrics compared:
 
 - **p50 / p95 / p99 latency** — a model that wins on cost but blows the latency budget doesn't ship
 
+### Current result (local run, synthetic sample)
+
+Reproduce with `uv run python -m src.training.train --backend local`:
+
+| Variant | ROC-AUC | PR-AUC | F1 | Cost / 1k txns | FP | FN |
+|---|---|---|---|---|---|---|
+| XGBoost | 0.754 | 0.413 | 0.444 | **984.69** | 6 | 14 |
+| LightGBM | 0.729 | 0.401 | 0.452 | 1017.40 | 2 | 15 |
+
+Two things worth noticing. **LightGBM wins on F1 but loses on cost** — precisely the disagreement the business metric exists to expose, since F1 treats a missed fraud and a blocked customer as equally bad. And the bootstrap interval for the cost difference is `[-143.96, +29.17]`, which **straddles zero**: on this test set the two variants are statistically indistinguishable. The pipeline therefore reports the result as *not significant* and keeps the incumbent rather than shipping a coin flip.
+
+These numbers come from the synthetic sample, whose difficulty is calibrated by a deliberate stealth-fraud cohort (35% of fraud carries no distinguishing signal). That caps achievable recall, which is why ROC-AUC sits near 0.75 rather than 1.0 — an honest ceiling rather than a leaky one.
+
 Results are published to an A/B dashboard (Phase 8).
 
 ---
@@ -251,7 +274,7 @@ Authentication uses **Workload Identity Federation** — GitHub Actions assumes 
 |---|---|---|
 | 1 | Repository scaffold + documentation | ✅ Complete |
 | 2 | Data ingestion + feature engineering | ✅ Complete |
-| 3 | Model training on Vertex AI | ⬜ Not started |
+| 3 | Model training on Vertex AI | ✅ Complete |
 | 4 | SHAP explainability module | ⬜ Not started |
 | 5 | FastAPI inference service | ⬜ Not started |
 | 6 | Drift monitoring | ⬜ Not started |
