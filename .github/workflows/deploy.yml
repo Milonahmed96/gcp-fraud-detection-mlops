@@ -168,6 +168,11 @@ jobs:
           set -euo pipefail
           SERVICE_JSON="$(gcloud run services describe "${INFERENCE_SERVICE}" \
             --region="${{ vars.GCP_REGION }}" --format=json)"
+
+          BASE="$(echo "${SERVICE_JSON}" | jq -er '.status.url')"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+          echo "base -> ${BASE}"
+
           for VARIANT in xgb lgbm; do
             URL="$(echo "${SERVICE_JSON}" | jq -er --arg tag "${VARIANT}" \
               '.status.traffic[] | select(.tag == $tag) | .url')"
@@ -192,15 +197,65 @@ jobs:
           id_token_audience: ${{ steps.urls.outputs.xgb }}
           id_token_include_email: true
 
+      # ---------------------------------------------------------------------
+      # TEMPORARY DIAGNOSTIC. Delete once we know which audience Cloud Run
+      # accepts for a *tagged* revision URL. Cloud Run answered 401 -- "the
+      # access token could not be verified" -- to a token minted for the tagged
+      # URL, which is an authentication failure, not authorisation
+      # (roles/run.admin already includes run.routes.invoke).
+      #
+      # Prints HTTP status codes only. Never echoes a token.
+      # ---------------------------------------------------------------------
+      - name: DIAGNOSTIC — mint an ID token for the BASE service url
+        id: idtoken_base
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.urls.outputs.base }}
+          id_token_include_email: true
+
+      - name: DIAGNOSTIC — which audience does Cloud Run accept?
+        run: |
+          # Deliberately NOT `set -e`: both probes must run even if one 401s.
+          set -uo pipefail
+          TAGGED="${{ steps.urls.outputs.xgb }}"
+          echo "probing ${TAGGED}/health"
+
+          probe() {
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $2" "${TAGGED}/health")"
+            echo "  audience=$1 -> HTTP ${CODE}"
+          }
+          probe "tagged" "${{ steps.idtoken_xgb.outputs.id_token }}"
+          probe "base  " "${{ steps.idtoken_base.outputs.id_token }}"
+
+          NO_TOKEN="$(curl -s -o /dev/null -w '%{http_code}' "${TAGGED}/health")"
+          echo "  no token      -> HTTP ${NO_TOKEN}  (expect 401/403: the service is private)"
+
       - name: Smoke-test the xgb revision before it sees a customer
         # If this fails the job stops and the previous revision keeps serving
         # 100%. The ordering IS the rollback strategy.
+        #
+        # The diagnostic above decides which token belongs here. Until then we
+        # try the base-audience token, falling back to the tagged-audience one.
         run: |
-          set -euo pipefail
-          curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
-            -H "Authorization: Bearer ${{ steps.idtoken_xgb.outputs.id_token }}" \
-            "${{ steps.urls.outputs.xgb }}/health" \
-            | tee /dev/stderr | grep -q '"status":"ok"'
+          set -uo pipefail
+          URL="${{ steps.urls.outputs.xgb }}/health"
+
+          for TOKEN in "${{ steps.idtoken_base.outputs.id_token }}" \
+                       "${{ steps.idtoken_xgb.outputs.id_token }}"; do
+            BODY="$(curl -s --retry 5 --retry-delay 3 --retry-connrefused \
+              -H "Authorization: Bearer ${TOKEN}" "${URL}")"
+            if echo "${BODY}" | grep -q '"status":"ok"'; then
+              echo "${BODY}"
+              echo "smoke test passed"
+              exit 0
+            fi
+          done
+          echo "smoke test FAILED: no audience produced a healthy response" >&2
+          exit 1
 
       - name: Mint an ID token for the lgbm revision
         id: idtoken_lgbm
@@ -214,11 +269,21 @@ jobs:
 
       - name: Smoke-test the lgbm revision before it sees a customer
         run: |
-          set -euo pipefail
-          curl -sf --retry 5 --retry-delay 3 --retry-connrefused \
-            -H "Authorization: Bearer ${{ steps.idtoken_lgbm.outputs.id_token }}" \
-            "${{ steps.urls.outputs.lgbm }}/health" \
-            | tee /dev/stderr | grep -q '"status":"ok"'
+          set -uo pipefail
+          URL="${{ steps.urls.outputs.lgbm }}/health"
+
+          for TOKEN in "${{ steps.idtoken_base.outputs.id_token }}" \
+                       "${{ steps.idtoken_lgbm.outputs.id_token }}"; do
+            BODY="$(curl -s --retry 5 --retry-delay 3 --retry-connrefused \
+              -H "Authorization: Bearer ${TOKEN}" "${URL}")"
+            if echo "${BODY}" | grep -q '"status":"ok"'; then
+              echo "${BODY}"
+              echo "smoke test passed"
+              exit 0
+            fi
+          done
+          echo "smoke test FAILED: no audience produced a healthy response" >&2
+          exit 1
 
       - name: Shift traffic per the A/B split
         run: |
