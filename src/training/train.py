@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -271,6 +272,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # Resolve argv explicitly: the Vertex backend forwards these flags to the
+    # remote job, and `argv or []` would silently forward nothing when invoked
+    # from a real command line (where argv is None and argparse reads sys.argv).
+    argv = sys.argv[1:] if argv is None else argv
     args = _build_parser().parse_args(argv)
     cost_model = CostModel(false_positive_cost=args.false_positive_cost)
 
@@ -279,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
         from src.training.vertex import submit_training_job
 
         config = load_config()
-        job = submit_training_job(config, source=args.source, args=argv or [])
+        job = submit_training_job(config, source=args.source, args=argv)
         logger.info("submitted Vertex AI training job: %s", job)
         return 0
 

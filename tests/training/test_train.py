@@ -9,11 +9,13 @@ statistics properly.
 from __future__ import annotations
 
 import json
+import sys
 
 import joblib
 import numpy as np
 import pytest
 
+from src.features.config import GCPConfig
 from src.training.dataset import load_features, temporal_split
 from src.training.metrics import CostModel
 from src.training.models import VARIANTS, predict_fraud_probability
@@ -178,3 +180,56 @@ class TestRunLocalTraining:
     def test_metrics_json_is_serialisable_without_numpy_types(self, tmp_path):
         run_local_training(output_dir=tmp_path, n_resamples=10)
         json.loads((tmp_path / "metrics.json").read_text())  # would raise on np.float64
+
+
+class TestVertexBackendCLI:
+    """The `--backend vertex` branch of main(), with the SDK stubbed out."""
+
+    @pytest.fixture
+    def submitted(self, monkeypatch):
+        from src.features import config as config_module
+        from src.training import train as train_module
+        from src.training import vertex as vertex_module
+
+        captured: dict = {}
+
+        def fake_submit(config, *, source="bigquery", args=None, **kwargs):
+            captured["source"] = source
+            captured["args"] = args
+            return "fake-job"
+
+        monkeypatch.setattr(vertex_module, "submit_training_job", fake_submit)
+        monkeypatch.setattr(
+            config_module,
+            "load_config",
+            lambda: GCPConfig("p", "europe-west2", "b", "d", "f"),
+        )
+        return captured, train_module
+
+    def test_forwards_flags_when_argv_is_passed_explicitly(self, submitted):
+        captured, train_module = submitted
+        assert train_module.main(["--backend", "vertex", "--bootstrap-resamples", "50"]) == 0
+        assert "--bootstrap-resamples" in captured["args"]
+
+    def test_forwards_flags_when_argv_comes_from_the_real_command_line(
+        self, submitted, monkeypatch
+    ):
+        """Regression: `main()` used to forward `argv or []`, so a real terminal
+        invocation (argv=None) silently dropped every flag on the remote run."""
+        captured, train_module = submitted
+        monkeypatch.setattr(
+            sys, "argv", ["train.py", "--backend", "vertex", "--bootstrap-resamples", "50"]
+        )
+
+        assert train_module.main() == 0
+        assert "--bootstrap-resamples" in captured["args"]
+        assert "50" in captured["args"]
+
+    def test_does_not_train_locally_when_submitting_to_vertex(self, submitted, monkeypatch):
+        captured, train_module = submitted
+        monkeypatch.setattr(
+            train_module,
+            "run_local_training",
+            lambda **kw: pytest.fail("must not train locally on the vertex backend"),
+        )
+        assert train_module.main(["--backend", "vertex"]) == 0
