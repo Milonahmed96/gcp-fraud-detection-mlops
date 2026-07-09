@@ -115,7 +115,25 @@ jobs:
 
       # --- Inference: one revision per A/B variant, neither taking traffic yet ---
 
-      - name: Deploy the XGBoost revision (no traffic)
+      - name: Decide whether --no-traffic applies
+        id: traffic
+        # `--no-traffic` is rejected when *creating* a service:
+        #   ERROR: --no-traffic not supported when creating a new service.
+        # That is fine, and safe: a service that does not exist has no live
+        # revision to protect, so nothing can be broken by the first one
+        # serving. On every subsequent deploy the flag applies and the
+        # smoke-test-before-traffic guarantee holds.
+        run: |
+          if gcloud run services describe "${INFERENCE_SERVICE}" \
+               --region="${{ vars.GCP_REGION }}" >/dev/null 2>&1; then
+            echo "flag=--no-traffic" >> "$GITHUB_OUTPUT"
+            echo "existing service — new revisions will take no traffic until smoke-tested"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+            echo "first deploy — creating the service; no live revision exists to protect"
+          fi
+
+      - name: Deploy the XGBoost revision
         run: |
           gcloud run deploy "${INFERENCE_SERVICE}" \
             --image="${{ steps.tags.outputs.inference }}" \
@@ -123,12 +141,13 @@ jobs:
             --revision-suffix="xgb-${GITHUB_SHA::7}" \
             --set-env-vars="SERVING_VARIANT=xgboost" \
             --tag=xgb \
-            --no-traffic \
+            ${{ steps.traffic.outputs.flag }} \
             --no-allow-unauthenticated \
             --memory=2Gi --cpu=2 --concurrency=40 --min-instances=0 --max-instances=10 \
             --quiet
 
       - name: Deploy the LightGBM revision (no traffic)
+        # The service certainly exists by now, so this one is always --no-traffic.
         run: |
           gcloud run deploy "${INFERENCE_SERVICE}" \
             --image="${{ steps.tags.outputs.inference }}" \
