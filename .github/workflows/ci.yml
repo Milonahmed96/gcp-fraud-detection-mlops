@@ -78,6 +78,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --frozen --extra gcp --extra dev
 
+      - name: Set up Buildx
+        # The default `docker` driver cannot export a build cache, so
+        # `cache-to: type=gha` fails with "Cache export is not supported for the
+        # docker driver". The docker-container driver supports both the GHA
+        # cache and `load: true`.
+        uses: docker/setup-buildx-action@v3
+
       - name: Train the models
         # Both Dockerfiles COPY artifacts/ at build time, so the images cannot
         # be built without a training run. Small bootstrap: ~30s on the sample.
