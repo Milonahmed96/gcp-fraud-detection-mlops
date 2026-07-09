@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_DIR = Path("artifacts")
 
+#: Rows used to estimate the training SHAP importance baseline. Exact
+#: TreeExplainer is linear in rows; a few thousand estimates a mean fine.
+IMPORTANCE_PROFILE_ROWS = 2000
+
 
 @dataclass(frozen=True)
 class TrainingResult:
@@ -164,6 +168,25 @@ def save_explainer(model: FittedModel, variant: str, dataset: Dataset, output_di
     return explainer.save(output_dir / f"explainer_{variant}.joblib")
 
 
+def save_drift_reference(model: FittedModel, dataset: Dataset, output_dir: Path) -> None:
+    """Capture the training feature distribution and SHAP importance profile.
+
+    These are the baselines the Phase 6 drift monitor compares production
+    traffic against. Written from the *training* split -- the distribution the
+    model actually learned -- not from test, which the model never saw.
+
+    Only the incumbent variant's explainer is profiled: `importance_shift` is a
+    comparison against one baseline, and mixing variants would make it
+    meaningless.
+    """
+    from src.evaluation.explainer import FraudExplainer
+    from src.monitoring.monitor import save_reference
+
+    explainer = FraudExplainer.from_model(model, list(dataset.train.X.columns))
+    importance = explainer.global_importance(dataset.train.X.head(IMPORTANCE_PROFILE_ROWS))
+    save_reference(dataset.train.X, importance, output_dir)
+
+
 def compare_variants(
     dataset: Dataset,
     *,
@@ -196,6 +219,10 @@ def compare_variants(
             )
 
     a, b = VARIANTS  # xgboost, lightgbm
+
+    if output_dir is not None:
+        # Baselines for the drift monitor, from the incumbent variant only.
+        save_drift_reference(models[a], dataset, output_dir)
     point, low, high = bootstrap_cost_difference(
         dataset.test.y,
         scores[a],

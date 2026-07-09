@@ -16,6 +16,9 @@ dependencies = [
     "numpy>=1.26",
     "python-dotenv>=1.0",
     "scikit-learn>=1.5",
+    # Imported directly by src/monitoring/drift.py (ks_2samp). Present
+    # transitively via scikit-learn, but depending on that would be a trap.
+    "scipy>=1.11",
     "xgboost>=2.1",
     "lightgbm>=4.5",
     "joblib>=1.4",
@@ -35,6 +38,7 @@ dependencies = [
 gcp = [
     "google-cloud-bigquery>=3.25",
     "google-cloud-aiplatform>=1.60",
+    "google-cloud-scheduler>=2.13",
     "pyarrow>=16.0",
 ]
 dev = [

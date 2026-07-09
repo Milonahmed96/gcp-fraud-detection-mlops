@@ -1,0 +1,57 @@
+# Drift-monitoring service image for Cloud Run.
+#
+# Separate from the inference image on purpose: this one needs the BigQuery and
+# Vertex AI SDKs (the `gcp` extra) to read production features and submit a
+# retraining job. Keeping them out of the inference image is worth ~500 MB on
+# every serving cold start.
+
+FROM python:3.11-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --extra gcp --no-install-project
+
+COPY src/ ./src/
+COPY README.md ./
+RUN uv sync --frozen --no-dev --extra gcp
+
+
+FROM python:3.11-slim AS runtime
+
+# OpenMP runtime for XGBoost/LightGBM: the drift check loads the model's
+# explainer to compute SHAP importance drift.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 1000 appuser
+
+WORKDIR /app
+
+COPY --from=builder --chown=appuser:appuser /app/.venv /app/.venv
+COPY --from=builder --chown=appuser:appuser /app/src /app/src
+
+# reference_profile.json and reference_importance.json are the baselines the
+# check compares against; the explainer supplies the secondary signal.
+COPY --chown=appuser:appuser artifacts/ /app/artifacts/
+COPY --chown=appuser:appuser data/sample/ /app/data/sample/
+
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MODEL_ARTIFACTS_DIR=/app/artifacts \
+    DRIFT_SOURCE=bigquery \
+    PORT=8080
+
+USER appuser
+EXPOSE 8080
+
+# One worker: this is a batch endpoint invoked once a day, not a serving path.
+CMD exec uvicorn src.monitoring.app:app --host 0.0.0.0 --port ${PORT} --workers 1

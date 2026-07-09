@@ -161,6 +161,9 @@ uv run python -m src.features.sample_data
 # Serve the inference API locally on :8080 (needs the artefacts from the step above)
 uv run uvicorn src.inference.app:app --reload --port 8080
 
+# Run the drift check against the sample, without triggering a retraining job
+uv run python -m src.monitoring.monitor --source sample --dry-run
+
 # Build and run the container exactly as Cloud Run will
 docker build -t fraud-inference-api .
 docker run --rm -p 8080:8080 -e SERVING_VARIANT=xgboost fraud-inference-api
@@ -340,6 +343,75 @@ Because every GCP call in this repo is lazy-imported, the BigQuery and Vertex AI
 
 ---
 
+## Drift monitoring
+
+Fraud labels arrive weeks late — a chargeback is not instant — so production AUC is not observable in time to act on. Drift detection is therefore **unsupervised**: it compares the distribution of features the model is *currently seeing* against the distribution it was *trained on*.
+
+Two independent signals, answering different questions:
+
+| Signal | Question | Gates retraining? |
+|---|---|---|
+| **PSI** per feature | Has the input distribution moved? | **Yes** — any feature ≥ 0.25 |
+| **KS** two-sample | Same, but sensitive to shifts coarse bins hide | No — its p-value collapses with sample size |
+| **SHAP `importance_shift`** | Has *what drives the model* changed? | No — reported for a human |
+
+Drift is `any(feature significant)`, not a mean. One feature moving hard is exactly the fraud-ring signature; averaging it across thirteen stable features would hide it.
+
+### Binning is where PSI implementations quietly break
+
+`is_night` is a bool. `txn_count_1h` is almost always 1. Hand either to a quantile binner and you get duplicate edges, empty bins, and a `log(0)` that surfaces as `inf` or `nan` rather than an error — a monitor that silently never fires. So:
+
+- Features with ≤ 10 distinct values (and all bools) are treated as **categorical**, not quantile-binned.
+- Outer bin edges are **infinite**, so a value beyond the training range lands in a bin instead of vanishing and deflating the PSI.
+- A category never seen in training is folded into the smallest reference bin — new behaviour is drift, not an error.
+- Every proportion is floored at `EPSILON` before any logarithm.
+
+The reference profile (`artifacts/reference_profile.json`) is captured from the **training split** — the distribution the model actually learned — not from test, which it never saw.
+
+### Verified behaviour
+
+```bash
+uv run python -m src.monitoring.monitor --source sample --dry-run
+```
+
+Against its own training distribution, the monitor is quiet — which matters more than catching drift, because a monitor that pages someone nightly gets muted:
+
+```
+stable: 0/13 features drifted significantly; worst customer_amount_mean_prior psi=0.0113 (n=6000)
+explanation drift (SHAP importance shift): 0.0111
+```
+
+Simulating a fraud ring (traffic goes foreign, card-not-present, 20× the customers' baselines, at 03:00):
+
+```
+DRIFT: 6/13 features drifted significantly; worst is_foreign psi=15.4015 (n=1500)
+explanation drift (SHAP importance shift): 0.2165
+  is_foreign psi=15.4015 (significant)
+  hour_of_day psi=12.7174 (significant)
+  card_not_present psi=11.9003 (significant)
+  amount_vs_customer_mean psi=6.4754 (significant)
+  ...
+drift detected; retraining SKIPPED (--dry-run)
+```
+
+### Deployment shape
+
+Cloud Scheduler fires an authenticated POST at a **separate Cloud Run service** (`Dockerfile.monitoring`), not at the inference API. Two concrete reasons: the inference image has no BigQuery SDK — that is what keeps it 500 MB smaller — and a minutes-long batch job must not share a request pool or scale-to-zero policy with a 10 ms latency-critical endpoint.
+
+```
+Cloud Scheduler ──(OIDC, 02:00 daily)──▶ Cloud Run: /drift-check
+                                              │
+                                              ├─ PSI vs reference_profile.json
+                                              ├─ SHAP importance_shift
+                                              └─ if drifted → Vertex AI retraining job
+```
+
+Authentication is an **OIDC token** minted for a service account, with the audience set to the bare service URL (Cloud Run rejects a token whose audience carries the request path). No API key lives in the job definition. Provisioning via `ensure_drift_check_job` is idempotent — it creates or updates in place, so a redeploy neither fails with `AlreadyExists` nor leaves a stale schedule behind.
+
+A retraining submission failure is logged, never raised: a 5xx would make Cloud Scheduler retry, and a retry storm here means a thundering herd of Vertex AI training jobs.
+
+---
+
 ## CI/CD
 
 `.github/workflows/` defines the pipeline (Phase 7):
@@ -369,7 +441,7 @@ Authentication uses **Workload Identity Federation** — GitHub Actions assumes 
 | 3 | Model training on Vertex AI | ✅ Complete |
 | 4 | SHAP explainability module | ✅ Complete |
 | 5 | FastAPI inference service | ✅ Complete |
-| 6 | Drift monitoring | ⬜ Not started |
+| 6 | Drift monitoring | ✅ Complete |
 | 7 | GitHub Actions CI/CD | ⬜ Not started |
 | 8 | A/B test dashboard | ⬜ Not started |
 | 9 | Final polish + `v1.0.0` tag | ⬜ Not started |

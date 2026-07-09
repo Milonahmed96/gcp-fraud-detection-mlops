@@ -1,9 +1,9 @@
 # project_context.md — Living Project State
 
 ## Status
-Phase: Phase 5 complete — FastAPI inference service merged to develop
-Last completed: feature/inference-service (src/inference/ built, 415 tests passing, container verified)
-Next task: Phase 6 — drift monitoring (src/monitoring/, Cloud Scheduler integration)
+Phase: Phase 6 complete — drift monitoring merged to develop
+Last completed: feature/drift-monitoring (src/monitoring/ built, 509 tests passing, endpoint driven live)
+Next task: Phase 7 — GitHub Actions CI/CD (.github/workflows/deploy.yml), then develop → main + tag
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -15,6 +15,7 @@ Next task: Phase 6 — drift monitoring (src/monitoring/, Cloud Scheduler integr
 - [x] PHASE 3 — src/training/: metrics, dataset, models, train, vertex, experiments (+ 129 tests)
 - [x] PHASE 4 — src/evaluation/: explainer (SHAP), experiments (Vertex + BigQuery audit log) (+ 78 tests)
 - [x] PHASE 5 — src/inference/: state, features, schemas, registry, app; Dockerfile; prediction_log schema (+ 97 tests)
+- [x] PHASE 6 — src/monitoring/: drift, monitor, scheduler, app; Dockerfile.monitoring (+ 94 tests)
 
 ## Decisions log
 | Decision | Rationale |
@@ -54,6 +55,17 @@ Next task: Phase 6 — drift monitoring (src/monitoring/, Cloud Scheduler integr
 | GCP SDKs moved to an optional `gcp` extra | Every GCP call is lazy-imported, so the serving image never needs them. Cuts the Cloud Run image from 2.67 GB to 2.16 GB; Cloud Run bills cold-start time against image size |
 | `to_naive_utc` converts offsets rather than dropping them | Discarding `+02:00` would shift the transaction two hours and silently change `is_night`, `hour_of_day`, and every velocity window |
 | Pydantic `extra="forbid"` on the request schema | A typo'd field name is a bug, not something to silently ignore into a confidently wrong prediction |
+| Drift detection is unsupervised (PSI on features), not AUC-based | Fraud labels arrive weeks late via chargebacks. Production AUC is not observable in time to act on |
+| Drift = `any(feature significant)`, never a mean | One feature moving hard is the fraud-ring signature. Averaging across 13 stable features would hide it |
+| Features with ≤10 distinct values (and all bools) are treated as categorical | Quantile-binning `is_night` or `txn_count_1h` (almost always 1) yields duplicate edges, empty bins, and `log(0)` → `inf`/`nan`. A monitor that silently never fires |
+| Every PSI proportion floored at `EPSILON=1e-6`; outer bin edges are `±inf` | Prevents `log(0)`, and stops a value beyond the training range from vanishing and deflating the PSI |
+| KS is reported but does not gate retraining | Its p-value shrinks with sample size, so a large daily batch flags drift that is real yet negligible |
+| Reference profile is built from the **training** split | The distribution the model actually learned. Test is a distribution it never saw |
+| Drift monitor is a **separate Cloud Run service + image** | The inference image has no BigQuery SDK (that's the 500 MB saving), and a minutes-long batch job must not share a request pool or scale-to-zero policy with a 10 ms endpoint |
+| Cloud Scheduler → OIDC token, audience = bare service URL | Cloud Run rejects a token whose audience carries the request path. No API key in the job definition |
+| `ensure_drift_check_job` creates-or-updates | A redeploy must not fail with `AlreadyExists`, nor leave a stale schedule behind |
+| A retraining submission failure is logged, not raised | A 5xx makes Cloud Scheduler retry → a thundering herd of Vertex AI training jobs. The check already did its job by reporting drift |
+| `scipy` declared explicitly despite arriving via scikit-learn | `drift.py` imports `ks_2samp` directly. Relying on a transitive dependency is a trap |
 
 ## Environment
 - Python 3.11
@@ -67,50 +79,51 @@ Next task: Phase 6 — drift monitoring (src/monitoring/, Cloud Scheduler integr
 - Vertex AI Feature Store: use managed (not optimised) for cost control on free-tier/trial
 
 ## Session handoff notes
-Phase 5 finished. `develop` carries `src/inference/`: `state.py` (causal `CustomerState` +
-`InMemoryStateStore`), `features.py` (`build_serving_features`), `schemas.py` (Pydantic contract),
-`registry.py` (`load_bundle`, trained threshold), `app.py` (`create_app()`, `/health`, `/predict`),
-plus a `Dockerfile` and `.dockerignore`. The Phase 4 gap is closed: `prediction_log` now has a real
-schema and `ensure_prediction_log()`. 415 tests pass; ruff is clean.
+Phase 6 finished. `develop` carries `src/monitoring/`: `drift.py` (PSI + KS, `ReferenceProfile`),
+`monitor.py` (`check_and_maybe_retrain`, CLI), `scheduler.py` (idempotent Cloud Scheduler job),
+`app.py` (drift-check Cloud Run service), plus `Dockerfile.monitoring`. `train.py` now also writes
+`reference_profile.json` and `reference_importance.json`. 509 tests pass; ruff is clean.
 
-**Verified for real, not just unit-tested.** The service was started with uvicorn and curled: a
-foreign / card-not-present / 03:15 / £4800 transaction scored `0.9945` (flagged), a domestic
-card-present £42 afternoon purchase scored `0.0011` (not flagged), latency 6–13 ms including SHAP.
-The Docker image was built and run; the container returned identical predictions and `/health` was
-ok. Image size 2.16 GB after moving the GCP SDKs to the `gcp` extra (was 2.67 GB).
+**Verified live, not just unit-tested.** `POST /drift-check` was driven with an empty body (as
+Scheduler sends) and returned `drifted=false, worst_psi=0.0113`. A simulated fraud ring (foreign,
+card-not-present, 20× baseline, 03:00) produced `DRIFT: 6/13 features, is_foreign psi=15.40`,
+explanation drift 0.2165 vs a 0.0111 baseline, retraining correctly skipped under `--dry-run`.
 
-Dependency layout changed: `uv sync` = inference only (what Docker installs);
-`uv sync --extra gcp --extra dev` = everything (what CI and local dev need). **The test suite
-requires the `gcp` extra** — `tests/features/test_bigquery.py` constructs real `SchemaField`s.
-Phase 7's CI workflow must use `--extra gcp --extra dev`.
+Artefacts now written by training: `model_*.joblib`, `explainer_*.joblib`, `metrics.json`,
+`reference_profile.json`, `reference_importance.json`. Both Dockerfiles copy `artifacts/` at build
+time, so **`docker build` requires a prior training run**.
 
-Nothing has been merged to `main` yet. Phase 5 is arguably the first deployable milestone, so a
-`develop` → `main` merge is now reasonable — but Phase 7 (CI/CD) is what makes the deploy
-reproducible, so waiting for it is defensible too. **Decision left to the user.**
+Dependency layout: `uv sync` = inference only (what `Dockerfile` installs);
+`uv sync --extra gcp --extra dev` = everything. **The test suite requires the `gcp` extra**
+(`tests/features/test_bigquery.py` constructs real `SchemaField`s), and `Dockerfile.monitoring`
+installs `--extra gcp`. Phase 7's CI workflow must use `--extra gcp --extra dev`.
 
-**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–5 is unit-tested
+**Nothing has been merged to `main` yet.** Deliberate: merging to `main` is what should trigger the
+CI/CD deploy, so promoting a `main` with no workflow behind it would make the first production merge
+manual and unreproducible. Phase 7 adds the workflow, then `develop` → `main` and tag `v1.0.0`.
+
+**Still no GCP resource has been provisioned.** Every cloud call across Phases 2–6 is unit-tested
 against fakes only. `submit_training_job`, `create_feature_store`, `ensure_dataset`,
-`ensure_prediction_log`, `log_training_run`, `log_global_importance`, and
-`log_predictions_to_bigquery` have never run against the live API. In particular
-`aiplatform.start_run(resume=True)` assumes the run already exists from
+`ensure_prediction_log`, `log_training_run`, `log_global_importance`,
+`log_predictions_to_bigquery`, `ensure_drift_check_job` have never run against the live API.
+In particular `aiplatform.start_run(resume=True)` assumes the run already exists from
 `src/training/experiments.py`; that ordering is untested against the real SDK.
 
-**Known gaps for later phases:**
-- The inference service does **not yet write to `prediction_log`**. The schema and the writer both
-  exist (`src/evaluation/experiments.py:log_predictions_to_bigquery`) but `app.py` never calls it —
-  wiring it in needs a BigQuery client on the serving path and an async/background write so the
-  request is not blocked. Phase 6 or 7.
+**Known gaps, carried forward:**
+- The inference service still does **not write to `prediction_log`**. Schema and writer both exist
+  but `app.py` never calls it — needs a BigQuery client on the serving path and a background write
+  so the request is not blocked. This also means the Phase 8 A/B dashboard currently has **no
+  production prediction data to read**; it will have to fall back to `metrics.json`.
 - `InMemoryStateStore` reads the committed CSV. The real `Featurestore` reader satisfying
-  `lookup(customer_id, as_of)` is not written yet.
-- `MAX_RECENT_EVENTS = 100` caps the online event log. `CustomerState.truncated` records when the
-  cap bit; nothing currently alerts on it.
+  `lookup(customer_id, as_of)` is not written.
+- `MAX_RECENT_EVENTS = 100` caps the online event log; `CustomerState.truncated` records when the
+  cap bit, but nothing alerts on it.
+- The drift monitor compares the *whole* current batch against the reference. There is no
+  windowing/cadence logic (e.g. "last 24h only") beyond the `--start-date`/`--end-date` bounds.
 
-Sample data: 6,000 rows, 2.13% fraud, 35% stealth-fraud cohort. Artefacts (models + explainers +
-`metrics.json`) land in `artifacts/` (gitignored) — the Dockerfile copies them in at build time, so
-`docker build` requires a prior training run.
-
-Phase 6 starts with:
-`git checkout develop && git pull && git checkout -b feature/drift-monitoring`
-It will build `src/monitoring/`: PSI/KS feature-distribution drift against the training reference,
-`importance_shift` on SHAP profiles as a second signal, a Cloud Scheduler-triggered entrypoint, and
-a retraining trigger.
+Phase 7 starts with:
+`git checkout develop && git pull && git checkout -b feature/cicd`
+It will build `.github/workflows/`: a PR check (ruff + pytest + docker build) and a deploy workflow
+on merge to `main` (build/push both images to Artifact Registry, deploy both Cloud Run services,
+smoke-test `/health`, shift traffic per the A/B split, provision the Scheduler job) using Workload
+Identity Federation — no service-account JSON key anywhere.
