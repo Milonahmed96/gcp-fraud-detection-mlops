@@ -2,9 +2,11 @@
 
 ## Status
 Phase: **DEPLOYED TO REAL GCP.** All 9 phases complete + live provisioning run.
-Last completed: live deploy via GitHub Actions/WIF — 2 Cloud Run services, 50/50 A/B split,
-  Cloud Scheduler enabled, 2 Vertex AI training jobs SUCCEEDED.
-Next task: provision Feature Store for the demo video, then tear down. See "Teardown" below.
+Last completed: Feature Store provisioned, populated (40 customers), read back, then DELETED
+  to stop the ~£0.90/hr meter. Total spend on it: ~£1.80.
+Next task: user records demo video. Feature Store can be recreated in ~17 min if needed.
+
+**Nothing is billing right now.** Cloud Run scales to zero; BigQuery/Scheduler are free-tier.
 
 ## Completed tasks
 - [x] TASK 1 — CLAUDE.md written (agent instructions, branching, commit convention)
@@ -112,14 +114,14 @@ Next task: provision Feature Store for the demo video, then tear down. See "Tear
 | GCS | `fraud-mlops-london-artifacts` | Vertex-written models/explainers/metrics |
 | Vertex AI | 2 CustomJobs | both `JOB_STATE_SUCCEEDED` |
 | Budget alert | £20, 50/90/100% | created before anything billable |
-| **Feature Store** | **not provisioned** | the only thing that bills while idle (~$0.90/node-hr) |
+| **Feature Store** | **deleted 2026-07-10 00:01 UTC** | was `fraud_online_store`; ~£0.90/hr, ~£1.80 total. Recreate with `create_feature_store` + `create_entity_type` + `ingest_online_features` |
 
 Verified live: fraud txn → `0.9958` FLAGGED (26ms, with SHAP); genuine → `0.0017`. Threshold
 `0.4333` (from the Vertex run, not 0.5). 8 `/health` calls → 7 xgboost, 1 lightgbm.
 
 GitHub: WIF secrets + 6 variables + `production` environment configured. Zero service-account keys.
 
-## The nine defects the live run found
+## The eleven defects the live run found
 
 Documented in README > "What the first live run found". Summary:
 1. BigQuery TIMESTAMP is microsecond-resolution (nanoseconds crash pyarrow)
@@ -131,9 +133,35 @@ Documented in README > "What the first live run found". Summary:
 7. `--no-traffic` rejected when creating a Cloud Run service
 8. `print-identity-token --impersonate-service-account` fails under WIF
 9. **ID token audience must be the BASE service URL, not the tagged revision URL**
+10. The Feature Store module could `create` and `read` but had **no way to write** — the store
+    provisioned empty. Added `latest_customer_state()` + `ingest_online_features()`.
+11. `cloudresourcemanager.googleapis.com` (and `cloudbuild`) were never enabled by
+    `setup_gcp.sh`; Feature Store ingestion needs the former. Both now enabled by the script.
+
+Bug #1 (nanosecond timestamps) recurred in the Feature Store path, because `ingest_from_df`
+stages through BigQuery. Fixed by reusing `bigquery.truncate_timestamps()`.
 
 Two tests were found to be *encoding* bugs rather than catching them (the `amount` exclusion
 assertion, and the impersonation assertion).
+
+## Feature Store: measured, and why it is not wired to serving
+
+Provisioned, populated with 40 customers' latest state, and read back:
+
+```
+entity_id  seconds_since_prev_txn  txn_count_1h  txn_count_24h  amount_sum_24h  customer_amount_mean_prior
+    c_000            16963.561153             1              5          453.15                  103.777952
+warm online lookup: 50–199 ms, median 153 ms
+unknown customer  : all None (handled, not an error)
+```
+
+**153 ms median lookup vs a 26 ms end-to-end `/predict` budget.** Wiring it in would make the
+endpoint six times slower. `InMemoryStateStore` is the right call at this scale — the dashed
+edge on the architecture diagram is a decision, not an omission.
+
+Console note: `gcloud ai feature-stores list|delete` no longer exist, and the modern console
+page reads `featureOnlineStores` (new API), which does not show legacy stores. Use the Python
+SDK or REST.
 
 ## Teardown (run when filming is done)
 
