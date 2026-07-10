@@ -38,6 +38,8 @@ gcloud services enable \
   bigquery.googleapis.com \
   cloudscheduler.googleapis.com \
   iamcredentials.googleapis.com \
+  cloudbuild.googleapis.com \
+  cloudresourcemanager.googleapis.com \
   --quiet
 
 echo "==> Artifact Registry"
