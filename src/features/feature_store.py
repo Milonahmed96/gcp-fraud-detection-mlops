@@ -16,7 +16,10 @@ passed in rather than constructed implicitly.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # pragma: no cover
+    import pandas as pd
 
 from src.features.config import GCPConfig
 from src.features.schema import (
@@ -138,6 +141,64 @@ def create_entity_type(feature_store: Any) -> Any:
             description=definition["description"],
         )
     return entity_type
+
+
+def latest_customer_state(features: "pd.DataFrame") -> "pd.DataFrame":
+    """Reduce an engineered feature frame to one row per customer: their latest.
+
+    The online store answers "what is true about this customer *now*", so only
+    the most recent row per customer is meaningful. Feeding it the full history
+    would store the same key many times and serve whichever version won the race.
+
+    Returns a frame with `customer_id`, `timestamp`, and the online features.
+    """
+    if features.empty:
+        raise FeatureStoreConfigError("cannot ingest an empty feature frame")
+
+    missing = [name for name in ONLINE_FEATURE_NAMES if name not in features.columns]
+    if missing:
+        raise FeatureStoreConfigError(
+            f"feature frame is missing online features: {', '.join(sorted(missing))}"
+        )
+
+    ordered = features.sort_values([ENTITY_ID_COLUMN, "timestamp"], kind="mergesort")
+    latest = ordered.groupby(ENTITY_ID_COLUMN, as_index=False).last()
+    columns = [ENTITY_ID_COLUMN, "timestamp", *ONLINE_FEATURE_NAMES]
+    out = latest[columns].copy()
+
+    # Vertex AI wants int64 counts as Python ints and a timezone-aware event time.
+    for spec in online_feature_specs():
+        if spec.field_type == "INTEGER":
+            out[spec.name] = out[spec.name].astype("int64")
+        elif spec.field_type == "FLOAT":
+            out[spec.name] = out[spec.name].astype("float64")
+
+    # `ingest_from_df` stages through BigQuery, whose TIMESTAMP is microsecond
+    # resolution. Nanoseconds raise `ArrowInvalid: ... would lose data`, exactly
+    # as on the offline ingestion path. Reuse the same flooring rather than
+    # writing a second implementation of it.
+    from src.features.bigquery import truncate_timestamps
+
+    out = truncate_timestamps(out)
+
+    if out["timestamp"].dt.tz is None:
+        out["timestamp"] = out["timestamp"].dt.tz_localize("UTC")
+    return out
+
+
+def ingest_online_features(entity_type: Any, latest: "pd.DataFrame") -> int:
+    """Write one row per customer into the online store. Returns rows written.
+
+    `feature_time_field` matters: Vertex AI keeps the value with the newest
+    event time, so a late-arriving backfill cannot overwrite fresher state.
+    """
+    entity_type.ingest_from_df(
+        feature_ids=list(ONLINE_FEATURE_NAMES),
+        feature_time="timestamp",
+        df_source=latest,
+        entity_id_field=ENTITY_ID_COLUMN,
+    )
+    return len(latest)
 
 
 def read_online_features(entity_type: Any, customer_ids: list[str]) -> Any:

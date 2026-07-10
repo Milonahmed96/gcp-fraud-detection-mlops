@@ -176,3 +176,101 @@ class TestEntityType:
             "entity_ids": ["c1", "c2"],
             "feature_ids": list(fs.ONLINE_FEATURE_NAMES),
         }
+
+
+class FakeEntityTypeWithIngest:
+    def __init__(self):
+        self.ingested: dict | None = None
+
+    def ingest_from_df(self, **kwargs):
+        self.ingested = kwargs
+        return self
+
+
+class TestLatestCustomerState:
+    """The online store answers 'what is true about this customer *now*'."""
+
+    def _frame(self):
+        import pandas as pd
+
+        return pd.DataFrame(
+            {
+                "customer_id": ["c1", "c1", "c2"],
+                "timestamp": pd.to_datetime(
+                    [
+                        "2024-01-01T09:00:00.111111111",
+                        "2024-01-01T10:00:00.222222222",
+                        "2024-01-01T11:00:00.333333333",
+                    ]
+                ),
+                "seconds_since_prev_txn": [-1.0, 3600.0, -1.0],
+                "txn_count_1h": [1, 1, 1],
+                "txn_count_24h": [1, 2, 1],
+                "amount_sum_24h": [10.0, 30.0, 5.0],
+                "customer_amount_mean_prior": [10.0, 10.0, 5.0],
+            }
+        )
+
+    def test_keeps_only_the_latest_row_per_customer(self):
+        latest = fs.latest_customer_state(self._frame())
+        assert len(latest) == 2
+        c1 = latest[latest["customer_id"] == "c1"].iloc[0]
+        assert c1["txn_count_24h"] == 2  # the 10:00 row, not the 09:00 one
+
+    def test_timestamps_are_floored_to_microseconds(self):
+        """`ingest_from_df` stages through BigQuery, which cannot hold nanoseconds.
+        Same ArrowInvalid as the offline path -- found on the first real ingest."""
+        latest = fs.latest_customer_state(self._frame())
+        assert (latest["timestamp"].dt.nanosecond == 0).all()
+
+    def test_timestamps_are_timezone_aware(self):
+        latest = fs.latest_customer_state(self._frame())
+        assert latest["timestamp"].dt.tz is not None
+
+    def test_only_the_online_features_are_carried(self):
+        latest = fs.latest_customer_state(self._frame())
+        assert set(latest.columns) == {"customer_id", "timestamp", *fs.ONLINE_FEATURE_NAMES}
+
+    def test_an_empty_frame_is_rejected(self):
+        import pandas as pd
+
+        with pytest.raises(fs.FeatureStoreConfigError, match="empty feature frame"):
+            fs.latest_customer_state(pd.DataFrame())
+
+    def test_a_frame_missing_online_features_is_rejected(self):
+        frame = self._frame().drop(columns=["txn_count_1h"])
+        with pytest.raises(fs.FeatureStoreConfigError, match="missing online features"):
+            fs.latest_customer_state(frame)
+
+
+class TestIngestOnlineFeatures:
+    def test_writes_every_online_feature_keyed_on_customer_id(self):
+        import pandas as pd
+
+        entity_type = FakeEntityTypeWithIngest()
+        latest = pd.DataFrame(
+            {
+                "customer_id": ["c1"],
+                "timestamp": pd.to_datetime(["2024-01-01T10:00:00"]).tz_localize("UTC"),
+                **{name: [1.0] for name in fs.ONLINE_FEATURE_NAMES},
+            }
+        )
+        assert fs.ingest_online_features(entity_type, latest) == 1
+        assert entity_type.ingested["feature_ids"] == list(fs.ONLINE_FEATURE_NAMES)
+        assert entity_type.ingested["entity_id_field"] == "customer_id"
+
+    def test_the_event_time_column_is_passed_through(self):
+        """Vertex keeps the newest event time, so a backfill cannot clobber
+        fresher state."""
+        import pandas as pd
+
+        entity_type = FakeEntityTypeWithIngest()
+        latest = pd.DataFrame(
+            {
+                "customer_id": ["c1"],
+                "timestamp": pd.to_datetime(["2024-01-01T10:00:00"]).tz_localize("UTC"),
+                **{name: [1.0] for name in fs.ONLINE_FEATURE_NAMES},
+            }
+        )
+        fs.ingest_online_features(entity_type, latest)
+        assert entity_type.ingested["feature_time"] == "timestamp"
